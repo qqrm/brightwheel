@@ -68,12 +68,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    bright::autostart::initialize_default()?;
+    brightwheel::autostart::initialize_default()?;
 
-    if let Ok(brightness) = bright::get(0) {
+    if let Ok(brightness) = brightwheel::get(0) {
         CURRENT_BRIGHTNESS.store(brightness.percent() as i32, Ordering::Relaxed);
     }
-    if let Ok(state) = bright::hdr::state() {
+    if let Ok(state) = brightwheel::hdr::state() {
         CURRENT_HDR.store(i32::from(state.enabled), Ordering::Relaxed);
     }
 
@@ -194,7 +194,7 @@ unsafe extern "system" fn window_proc(
             0
         }
         TOGGLE_HDR => {
-            match bright::hdr::toggle() {
+            match brightwheel::hdr::toggle() {
                 Ok(state) => {
                     CURRENT_HDR.store(i32::from(state.enabled), Ordering::Relaxed);
                     update_tooltip(window);
@@ -306,7 +306,7 @@ fn brightness_worker(receiver: Receiver<WheelEvent>) {
             continue;
         }
 
-        let brightness = match bright::change(0, adjustment) {
+        let brightness = match brightwheel::change(0, adjustment) {
             Ok(brightness) => brightness.percent() as i32,
             Err(_) => -1,
         };
@@ -455,7 +455,7 @@ fn show_context_menu(window: HWND) {
         return;
     }
 
-    let autostart_enabled = bright::autostart::is_enabled().unwrap_or(false);
+    let autostart_enabled = brightwheel::autostart::is_enabled().unwrap_or(false);
     let autostart_label = wide("Start with Windows");
     let exit_label = wide("Exit");
     let check_flag = if autostart_enabled {
@@ -494,7 +494,7 @@ fn show_context_menu(window: HWND) {
 
     match command {
         MENU_AUTOSTART => {
-            if let Err(error) = bright::autostart::set_enabled(!autostart_enabled) {
+            if let Err(error) = brightwheel::autostart::set_enabled(!autostart_enabled) {
                 show_error(&error.to_string());
             }
         }

@@ -55,6 +55,12 @@ DisplayWidget's background polling.
 
 ## Build
 
+Install directly from crates.io on Windows:
+
+```powershell
+cargo install brightwheel --locked
+```
+
 Build from a Windows shell:
 
 ```powershell

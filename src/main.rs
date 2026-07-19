@@ -22,7 +22,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match command.as_str() {
         "list" => {
             ensure_no_extra(args)?;
-            for monitor in bright::list()? {
+            for monitor in brightwheel::list()? {
                 match monitor.brightness {
                     Ok(value) => println!(
                         "{}\t{}\t{}\t{}/{}\t{}%",
@@ -54,33 +54,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "get" => {
             let index = optional_index(&mut args)?;
             ensure_no_extra(args)?;
-            println!("{}", bright::get(index)?.percent());
+            println!("{}", brightwheel::get(index)?.percent());
         }
         "set" => {
             let percent = required_u32(&mut args, "PERCENT")?;
             let index = optional_index(&mut args)?;
             ensure_no_extra(args)?;
-            println!("{}", bright::set(index, percent)?.percent());
+            println!("{}", brightwheel::set(index, percent)?.percent());
         }
         "change" => {
             let delta = required_i32(&mut args, "DELTA")?;
             let index = optional_index(&mut args)?;
             ensure_no_extra(args)?;
-            println!("{}", bright::change(index, delta)?.percent());
+            println!("{}", brightwheel::change(index, delta)?.percent());
         }
         "capabilities" | "caps" => {
             let index = optional_index(&mut args)?;
             ensure_no_extra(args)?;
-            println!("{}", bright::capabilities(index)?);
+            println!("{}", brightwheel::capabilities(index)?);
         }
         "hdr" => {
             ensure_no_extra(args)?;
-            let state = bright::hdr::state()?;
+            let state = brightwheel::hdr::state()?;
             println!("{}", if state.enabled { "on" } else { "off" });
         }
         "hdr-toggle" => {
             ensure_no_extra(args)?;
-            let state = bright::hdr::toggle()?;
+            let state = brightwheel::hdr::toggle()?;
             println!("{}", if state.enabled { "on" } else { "off" });
         }
         "help" | "--help" | "-h" => print_usage(),

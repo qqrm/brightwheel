@@ -1,15 +1,45 @@
 [package]
-name = "bright"
+name = "brightwheel"
 version = "0.1.0"
 edition = "2024"
-description = "Minimal DDC/CI brightness control for external Windows monitors"
+description = "Windows tray utility for DDC/CI monitor brightness and HDR control"
 license = "MIT"
+repository = "https://github.com/qqrm/brightwheel"
+homepage = "https://github.com/qqrm/brightwheel"
+readme = "README.md"
+keywords = ["windows", "monitor", "brightness", "ddc-ci", "tray"]
+categories = ["command-line-utilities", "gui", "hardware-support", "os::windows-apis"]
+rust-version = "1.85"
+publish = ["crates-io"]
+autobins = false
+include = [
+    "/.cargo/config.toml",
+    "/assets/brightwheel.ico",
+    "/assets/brightwheel.rc",
+    "/build.rs",
+    "/Cargo.lock",
+    "/Cargo.toml",
+    "/LICENSE",
+    "/README.md",
+    "/src/**",
+]
+
+[[bin]]
+name = "bright"
+path = "src/main.rs"
+
+[[bin]]
+name = "brightwheel"
+path = "src/bin/brightwheel.rs"
 
 [profile.dev]
 incremental = false
 
 [profile.test]
 incremental = false
+
+[package.metadata.docs.rs]
+targets = ["x86_64-pc-windows-msvc"]
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
