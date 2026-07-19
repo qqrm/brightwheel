@@ -145,7 +145,8 @@ const USAGE: &str = "Usage:
   bright hdr
   bright hdr-toggle
 
-PERCENT is 0..100. MONITOR defaults to 0.";
+PERCENT is 0..100. MONITOR is an optional numeric index shown by bright list.
+Type the number without square brackets; the default is 0.";
 
 #[cfg(test)]
 mod tests {
