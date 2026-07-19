@@ -1,10 +1,8 @@
 # BrightWheel
 
-Small Windows CLI for controlling external monitor brightness over DDC/CI.
-It talks directly to the Windows monitor configuration API in `dxva2.dll` and
-does not depend on ASUS DisplayWidget or its service.
-
-The project also builds `brightwheel.exe`, a tray-only Windows application:
+BrightWheel is a tray-only Windows application for controlling external monitor
+brightness over DDC/CI. It talks directly to the Windows monitor configuration
+API in `dxva2.dll` and does not depend on ASUS DisplayWidget or its service.
 
 - hover the tray icon and turn the mouse wheel to change primary-monitor
   brightness; continuous scrolling accelerates dynamically from precise 2%
@@ -19,6 +17,9 @@ The project also builds `brightwheel.exe`, a tray-only Windows application:
 - only one instance can run at a time;
 - the MSVC runtime is linked statically, so the release executable only uses
   DLLs included with Windows.
+
+The package also includes `bright.exe`, an optional command-line companion for
+diagnostics, scripts, and direct brightness or HDR control.
 
 `brightwheel.exe` is self-contained and does not ship an ASUS library. The
 brightness control works with external monitors that expose MCCS VCP `0x10`
@@ -55,6 +56,9 @@ DisplayWidget's background polling.
 
 ## Build
 
+Download `brightwheel.exe` from the latest GitHub Release to run the tray app
+without installing Rust. The release ZIP also includes the optional CLI.
+
 Install directly from crates.io on Windows:
 
 ```powershell
@@ -79,6 +83,13 @@ caches accessed through `\\wsl.localhost`.
 
 The executables are `target\release\bright.exe` and
 `target\release\brightwheel.exe`.
+
+## Release
+
+Pushing a `vX.Y.Z` tag whose version matches `Cargo.toml` runs the release
+workflow. It validates the project, builds both Windows executables, creates a
+ZIP and SHA-256 checksums, uploads them to a GitHub Release, and publishes the
+same version to crates.io.
 
 ## Commands
 

@@ -1,24 +1,60 @@
-name: Publish crate
+name: Release
 
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag to release
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
-  publish:
-    if: github.ref == 'refs/heads/main'
+  release:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     environment: release
     permissions:
-      contents: read
+      contents: write
       id-token: write
+    env:
+      CARGO_TERM_COLOR: always
+      GH_TOKEN: ${{ github.token }}
 
     steps:
-      - name: Checkout main
+      - name: Checkout release tag
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Validate release version
+        id: release
+        shell: pwsh
+        run: |
+          $tag = if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            '${{ inputs.tag }}'
+          } else {
+            '${{ github.ref_name }}'
+          }
+
+          if ($tag -notmatch '^v(?<version>\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$') {
+            throw "Release tag '$tag' is not in vX.Y.Z form."
+          }
+          $version = $Matches.version
+
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $package = $metadata.packages | Where-Object name -eq 'brightwheel'
+          if (-not $package -or $package.version -ne $version) {
+            throw "Tag version $version does not match the brightwheel package version."
+          }
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
@@ -35,8 +71,71 @@ jobs:
       - name: Run tests
         run: cargo test --all-targets --locked
 
-      - name: Verify package
+      - name: Verify crate package
         run: cargo publish --dry-run --locked
+
+      - name: Build release binaries
+        run: cargo build --release --locked
+
+      - name: Package release assets
+        id: assets
+        shell: pwsh
+        run: |
+          $version = '${{ steps.release.outputs.version }}'
+          $dist = Join-Path $PWD 'target\dist'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+
+          $tray = Join-Path $dist 'brightwheel.exe'
+          $cli = Join-Path $dist 'bright.exe'
+          Copy-Item 'target\release\brightwheel.exe' $tray -Force
+          Copy-Item 'target\release\bright.exe' $cli -Force
+
+          $zipName = "brightwheel-$version-x86_64-pc-windows-msvc.zip"
+          $zip = Join-Path $dist $zipName
+          Compress-Archive -Path $tray, $cli -DestinationPath $zip -Force
+
+          $checksumFiles = @($tray, $cli, $zip)
+          $checksums = foreach ($file in $checksumFiles) {
+            $hash = (Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $([IO.Path]::GetFileName($file))"
+          }
+          $checksums | Set-Content (Join-Path $dist 'SHA256SUMS.txt') -Encoding utf8NoBOM
+
+          "dist=$dist" >> $env:GITHUB_OUTPUT
+          "zip=$zipName" >> $env:GITHUB_OUTPUT
+
+      - name: Create or update GitHub Release
+        shell: pwsh
+        run: |
+          $tag = '${{ steps.release.outputs.tag }}'
+          $version = '${{ steps.release.outputs.version }}'
+          $dist = '${{ steps.assets.outputs.dist }}'
+          $assets = @(
+            (Join-Path $dist 'brightwheel.exe'),
+            (Join-Path $dist 'bright.exe'),
+            (Join-Path $dist '${{ steps.assets.outputs.zip }}'),
+            (Join-Path $dist 'SHA256SUMS.txt')
+          )
+          $notes = Join-Path $dist 'RELEASE_NOTES.md'
+          @"
+          BrightWheel $version
+
+          Windows tray application for DDC/CI monitor brightness and HDR control.
+
+          Download ``brightwheel.exe`` to run the tray app. ``bright.exe`` is the optional command-line companion. The ZIP contains both executables.
+
+          Requirements: 64-bit Windows 10/11 and an external monitor with DDC/CI enabled. The executables are unsigned, so Windows SmartScreen may show a warning on first launch.
+          "@ | Set-Content $notes -Encoding utf8NoBOM
+
+          & gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            & gh release edit $tag --title "BrightWheel $version" --notes-file $notes
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to update the GitHub Release.' }
+            & gh release upload $tag @assets --clobber
+          } else {
+            & gh release create $tag @assets --verify-tag --title "BrightWheel $version" --notes-file $notes
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to upload GitHub Release assets.' }
 
       - name: Authenticate with crates.io trusted publishing
         id: crates_auth
@@ -51,4 +150,14 @@ jobs:
           if (-not $env:CARGO_REGISTRY_TOKEN) {
             throw 'No crates.io token is available. Configure trusted publishing or the release environment secret.'
           }
-          cargo publish --locked
+
+          $output = & cargo publish --locked 2>&1
+          $exitCode = $LASTEXITCODE
+          $text = $output | Out-String
+          Write-Host $text
+          if ($exitCode -eq 0) { exit 0 }
+          if ($text -match 'already uploaded|already exists|already published') {
+            Write-Host 'This crate version is already published; treating the release as successful.'
+            exit 0
+          }
+          throw 'cargo publish failed.'
