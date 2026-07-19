@@ -6,7 +6,8 @@ use std::ptr;
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    HHOOK, MB_ICONERROR, MB_OK, MessageBoxW, UnhookWindowsHookEx,
+    HHOOK, HWND_BROADCAST, MB_ICONERROR, MB_OK, MessageBoxW, SC_MONITORPOWER, SendNotifyMessageW,
+    UnhookWindowsHookEx, WM_SYSCOMMAND,
 };
 
 pub(crate) fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
@@ -24,6 +25,18 @@ pub(crate) fn show_error(message: &str) {
             title.as_ptr(),
             MB_OK | MB_ICONERROR,
         );
+    }
+}
+
+pub(crate) fn power_off_monitors() -> io::Result<()> {
+    // SAFETY: this sends a system command containing no pointer data. The
+    // notification variant returns without waiting on windows in other threads.
+    let sent =
+        unsafe { SendNotifyMessageW(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER as usize, 2) };
+    if sent == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
