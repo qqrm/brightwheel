@@ -84,6 +84,34 @@ caches accessed through `\\wsl.localhost`.
 The executables are `target\release\bright.exe` and
 `target\release\brightwheel.exe`.
 
+## Development
+
+The source is organized by responsibility:
+
+- `src/ddc` owns physical monitor discovery, DDC/CI retries, and handle cleanup;
+- `src/autostart.rs` and `src/hdr.rs` wrap their respective Windows APIs;
+- `src/cli.rs` contains the typed command parser and CLI execution;
+- `src/tray` separates gesture policy, Win32 lifecycle, tray presentation, and
+  small resource-owning platform wrappers.
+
+Run the same checks used by CI from a Windows shell. The formatting, Clippy,
+test, and package commands can also be run by invoking `cargo.exe` from WSL:
+
+```powershell
+cargo fmt --all -- --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --all-targets --locked
+cargo doc --no-deps --locked
+cargo publish --dry-run --locked
+```
+
+When running `cargo doc` through WSL, set `CARGO_TARGET_DIR` to a Windows-local
+directory. Rustdoc cannot create its lock file under a `\\wsl.localhost` target
+directory; CI and native Windows checkouts are unaffected.
+
+The test suite covers hardware-independent behavior. DDC/CI and HDR integration
+still require a compatible physical monitor for manual verification.
+
 ## Release
 
 Pushing a `vX.Y.Z` tag whose version matches `Cargo.toml` runs the release

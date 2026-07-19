@@ -1,3 +1,5 @@
+//! Compiles the Windows icon resource into the `BrightWheel` tray executable.
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
