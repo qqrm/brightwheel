@@ -66,6 +66,11 @@ Building the tray executable requires the Windows SDK resource compiler
 loads the tray icon from its own resources; the image files are not needed at
 runtime.
 
+The repository can live on the WSL filesystem and be built by invoking
+`cargo.exe` from WSL. Incremental compilation is disabled for development and
+test profiles because Windows file locking is not supported for incremental
+caches accessed through `\\wsl.localhost`.
+
 The executables are `target\release\bright.exe` and
 `target\release\brightwheel.exe`.
 

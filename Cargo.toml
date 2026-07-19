@@ -5,6 +5,12 @@ edition = "2024"
 description = "Minimal DDC/CI brightness control for external Windows monitors"
 license = "MIT"
 
+[profile.dev]
+incremental = false
+
+[profile.test]
+incremental = false
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Win32_Devices_Display",
