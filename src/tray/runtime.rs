@@ -268,7 +268,7 @@ unsafe extern "system" fn window_proc(
             match brightwheel::hdr::toggle() {
                 Ok(state) => {
                     STATE.hdr.store(i32::from(state.enabled), Ordering::Relaxed);
-                    tray_icon::update(window, STATE.status());
+                    tray_icon::update(window, STATE.icon(), STATE.status());
                 }
                 Err(error) => show_error(&error.to_string()),
             }
@@ -276,7 +276,7 @@ unsafe extern "system" fn window_proc(
         }
         BRIGHTNESS_UPDATED => {
             STATE.brightness.store(wparam as i32, Ordering::Relaxed);
-            tray_icon::update(window, STATE.status());
+            tray_icon::update(window, STATE.icon(), STATE.status());
             0
         }
         SCHEDULE_MONITOR_POWER_OFF => {

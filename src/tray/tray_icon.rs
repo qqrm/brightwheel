@@ -16,6 +16,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP, WM_NULL,
 };
 
+use super::brightness_icon::BrightnessIcon;
 use super::platform::wide;
 
 pub(crate) const CALLBACK_MESSAGE: u32 = WM_APP + 1;
@@ -37,10 +38,11 @@ pub(crate) struct Status {
 }
 
 pub(crate) fn add(window: HWND, icon: HICON, status: Status) -> io::Result<()> {
+    let dynamic_icon = BrightnessIcon::create(icon, status.brightness).ok();
     let mut data = data(window);
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     data.uCallbackMessage = CALLBACK_MESSAGE;
-    data.hIcon = icon;
+    data.hIcon = dynamic_icon.as_ref().map_or(icon, BrightnessIcon::handle);
     set_tooltip(&mut data.szTip, status);
 
     // SAFETY: `data` is initialized with its exact ABI size and valid handles.
@@ -60,9 +62,14 @@ pub(crate) fn add(window: HWND, icon: HICON, status: Status) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn update(window: HWND, status: Status) {
+pub(crate) fn update(window: HWND, icon: HICON, status: Status) {
+    let dynamic_icon = BrightnessIcon::create(icon, status.brightness).ok();
     let mut data = data(window);
     data.uFlags = NIF_TIP | NIF_SHOWTIP;
+    if let Some(icon) = &dynamic_icon {
+        data.uFlags |= NIF_ICON;
+        data.hIcon = icon.handle();
+    }
     set_tooltip(&mut data.szTip, status);
     // SAFETY: `data` identifies the existing icon and contains a valid tooltip.
     unsafe {

@@ -2,6 +2,7 @@
 
 #![windows_subsystem = "windows"]
 
+mod brightness_icon;
 mod gesture;
 mod platform;
 mod runtime;

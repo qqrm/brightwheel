@@ -6,6 +6,7 @@ require vendor software.
 
 From the tray icon you can:
 
+- see the current brightness as an icon color from gray (0%) to yellow (100%);
 - scroll to change the primary monitor's brightness;
 - double-click to toggle HDR;
 - hold left Ctrl and click to turn off all monitors after five seconds;
