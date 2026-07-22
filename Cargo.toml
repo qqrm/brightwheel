@@ -1,6 +1,6 @@
 [package]
 name = "brightwheel"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "Windows tray utility for DDC/CI monitor brightness and HDR control"
 license = "MIT"
