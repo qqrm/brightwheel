@@ -10,7 +10,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, DestroyIcon, GetIconInfo, HICON, ICONINFO,
 };
 
-const OFF: (u8, u8, u8) = (128, 128, 128);
+/// A dim amber glow keeps the bulb discoverable in the tray at 0% brightness.
+const MINIMUM_GLOW: (u8, u8, u8) = (160, 136, 48);
 const ON: (u8, u8, u8) = (255, 212, 59);
 const SOCKET: (u8, u8, u8) = (0, 0, 0);
 
@@ -257,17 +258,21 @@ fn color(brightness: u32) -> (u8, u8, u8) {
     let mix = |off: u8, on: u8| {
         ((u32::from(off) * (100 - brightness) + u32::from(on) * brightness + 50) / 100) as u8
     };
-    (mix(OFF.0, ON.0), mix(OFF.1, ON.1), mix(OFF.2, ON.2))
+    (
+        mix(MINIMUM_GLOW.0, ON.0),
+        mix(MINIMUM_GLOW.1, ON.1),
+        mix(MINIMUM_GLOW.2, ON.2),
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{OFF, ON, color};
+    use super::{MINIMUM_GLOW, ON, color};
 
     #[test]
     fn interpolates_icon_color_across_brightness_range() {
-        assert_eq!(color(0), OFF);
-        assert_eq!(color(50), (192, 170, 94));
+        assert_eq!(color(0), MINIMUM_GLOW);
+        assert_eq!(color(50), (208, 174, 54));
         assert_eq!(color(100), ON);
         assert_eq!(color(101), ON);
     }
