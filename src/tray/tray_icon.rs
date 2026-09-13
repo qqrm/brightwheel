@@ -175,7 +175,7 @@ fn tooltip(status: Status) -> String {
         Some(true) => "HDR On",
         None => "HDR unavailable",
     };
-    format!("BrightWheel | {brightness} | {hdr}")
+    format!("{brightness} | {hdr} | Double-click: off | Middle-click: HDR")
 }
 
 fn copy_wide(destination: &mut [u16], value: &str) {
@@ -244,11 +244,11 @@ mod tests {
                 brightness: Some(77),
                 hdr: Some(true)
             }),
-            "BrightWheel | Brightness 77% | HDR On"
+            "Brightness 77% | HDR On | Double-click: off | Middle-click: HDR"
         );
         assert_eq!(
             tooltip(Status::default()),
-            "BrightWheel | Brightness unavailable | HDR unavailable"
+            "Brightness unavailable | HDR unavailable | Double-click: off | Middle-click: HDR"
         );
     }
 

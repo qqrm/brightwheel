@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    WHEEL_DELTA, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WHEEL_DELTA, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
 };
 
 const ACCELERATION_RESET: Duration = Duration::from_millis(350);
@@ -66,7 +66,7 @@ pub(crate) fn needs_tray_hit_test(
 ) -> bool {
     match message {
         WM_MOUSEMOVE => interaction_active || click_pending,
-        WM_MOUSEWHEEL | WM_LBUTTONUP => true,
+        WM_MOUSEWHEEL | WM_LBUTTONUP | WM_MBUTTONUP => true,
         _ => false,
     }
 }
@@ -88,7 +88,7 @@ mod tests {
     };
     use std::time::{Duration, Instant};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONUP,
+        WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONUP,
     };
 
     fn event(steps: i32, timestamp: Instant) -> WheelEvent {
@@ -165,6 +165,7 @@ mod tests {
         assert!(needs_tray_hit_test(WM_MOUSEMOVE, false, true));
         assert!(needs_tray_hit_test(WM_MOUSEWHEEL, false, false));
         assert!(needs_tray_hit_test(WM_LBUTTONUP, false, false));
+        assert!(needs_tray_hit_test(WM_MBUTTONUP, false, false));
         assert!(!needs_tray_hit_test(WM_RBUTTONUP, true, true));
     }
 }

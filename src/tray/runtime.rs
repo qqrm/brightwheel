@@ -9,16 +9,13 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetDoubleClickTime, VK_LCONTROL,
-};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CS_DBLCLKS, CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetMessageW, HC_ACTION, HICON, HWND_MESSAGE, IDI_APPLICATION, KillTimer, LoadCursorW,
-    LoadIconW, MSG, MSLLHOOKSTRUCT, PostMessageW, PostQuitMessage, RegisterClassW,
-    RegisterWindowMessageW, SetTimer, SetWindowsHookExW, TranslateMessage, WH_MOUSE_LL, WM_APP,
-    WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONUP, WM_TIMER,
-    WNDCLASSW,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+    HC_ACTION, HICON, HWND_MESSAGE, IDI_APPLICATION, LoadCursorW, LoadIconW, MSG, MSLLHOOKSTRUCT,
+    PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetWindowsHookExW,
+    TranslateMessage, WH_MOUSE_LL, WM_APP, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP, WM_MBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONUP, WNDCLASSW,
 };
 
 use super::gesture::{
@@ -33,9 +30,7 @@ const INSTANCE_MUTEX: &str = "Local\\BrightWheel.Singleton";
 const ICON_RESOURCE_ID: usize = 1;
 const BRIGHTNESS_UPDATED: u32 = WM_APP + 2;
 const TOGGLE_HDR: u32 = WM_APP + 3;
-const SCHEDULE_MONITOR_POWER_OFF: u32 = WM_APP + 4;
-const MONITOR_POWER_TIMER_ID: usize = 1;
-const MONITOR_POWER_DELAY_MS: u32 = 5_000;
+const POWER_OFF_MONITORS: u32 = WM_APP + 4;
 const BATCH_WINDOW: Duration = Duration::from_millis(40);
 
 static STATE: SharedState = SharedState::new();
@@ -110,7 +105,6 @@ pub(crate) fn run() -> Result<(), Box<dyn Error>> {
     let class_name = wide(WINDOW_CLASS);
     let window_title = wide(WINDOW_TITLE);
     let window_class = WNDCLASSW {
-        style: CS_DBLCLKS,
         lpfnWndProc: Some(window_proc),
         hInstance: module,
         // SAFETY: the standard arrow cursor is a process-independent resource.
@@ -279,22 +273,7 @@ unsafe extern "system" fn window_proc(
             tray_icon::update(window, STATE.icon(), STATE.status());
             0
         }
-        SCHEDULE_MONITOR_POWER_OFF => {
-            // Reusing the same window/timer ID restarts an existing countdown.
-            // SAFETY: `window` is live and owns the message-loop timer.
-            if unsafe { SetTimer(window, MONITOR_POWER_TIMER_ID, MONITOR_POWER_DELAY_MS, None) }
-                == 0
-            {
-                show_error(&io::Error::last_os_error().to_string());
-            }
-            0
-        }
-        WM_TIMER if wparam == MONITOR_POWER_TIMER_ID => {
-            // Window timers repeat, so disarm this one before powering off.
-            // SAFETY: the timer belongs to this live window.
-            unsafe {
-                KillTimer(window, MONITOR_POWER_TIMER_ID);
-            }
+        POWER_OFF_MONITORS => {
             if let Err(error) = power_off_monitors() {
                 show_error(&error.to_string());
             }
@@ -362,19 +341,6 @@ fn handle_mouse_event(window: HWND, message: u32, event: &MSLLHOOKSTRUCT, over_i
             }
         }
         WM_LBUTTONUP if over_icon => {
-            // SAFETY: `GetAsyncKeyState` accepts any virtual-key code and does
-            // not dereference application memory.
-            let left_control_pressed =
-                unsafe { GetAsyncKeyState(VK_LCONTROL as i32) } as u16 & 0x8000 != 0;
-            if left_control_pressed {
-                STATE.last_left_click.store(0, Ordering::Relaxed);
-                // SAFETY: `window` is the current live message window.
-                unsafe {
-                    PostMessageW(window, SCHEDULE_MONITOR_POWER_OFF, 0, 0);
-                }
-                return;
-            }
-
             let previous = STATE.last_left_click.swap(event.time, Ordering::Relaxed);
             // SAFETY: `GetDoubleClickTime` takes no pointer arguments.
             let maximum_interval = unsafe { GetDoubleClickTime() };
@@ -382,8 +348,14 @@ fn handle_mouse_event(window: HWND, message: u32, event: &MSLLHOOKSTRUCT, over_i
                 STATE.last_left_click.store(0, Ordering::Relaxed);
                 // SAFETY: `window` is the current live message window.
                 unsafe {
-                    PostMessageW(window, TOGGLE_HDR, 0, 0);
+                    PostMessageW(window, POWER_OFF_MONITORS, 0, 0);
                 }
+            }
+        }
+        WM_MBUTTONUP if over_icon => {
+            // SAFETY: `window` is the current live message window.
+            unsafe {
+                PostMessageW(window, TOGGLE_HDR, 0, 0);
             }
         }
         WM_LBUTTONUP => STATE.last_left_click.store(0, Ordering::Relaxed),

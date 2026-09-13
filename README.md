@@ -8,8 +8,8 @@ From the tray icon you can:
 
 - see the current brightness as an icon color from gray (0%) to yellow (100%);
 - scroll to change the primary monitor's brightness;
-- double-click to toggle HDR;
-- hold left Ctrl and click to turn off all monitors after five seconds;
+- double-click to turn off all monitors immediately;
+- middle-click to toggle HDR;
 - enable or disable startup with Windows, or exit the app.
 
 Scrolling accelerates from precise 2% steps to 10% steps during a continuous
