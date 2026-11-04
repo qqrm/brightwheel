@@ -24,7 +24,11 @@ static UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 pub(super) fn start(window: HWND) {
     if cfg!(debug_assertions) {
-        tray_icon::notify(window, "BrightWheel", "Use a release build to check for updates");
+        tray_icon::notify(
+            window,
+            "BrightWheel",
+            "Use a release build to check for updates",
+        );
         return;
     }
     if UPDATE_RUNNING.swap(true, Ordering::AcqRel) {
@@ -39,7 +43,11 @@ pub(super) fn start(window: HWND) {
             if thread::Builder::new()
                 .name("brightwheel-update-monitor".into())
                 .spawn(move || {
-                    let code = child.wait().ok().and_then(|status| status.code()).unwrap_or(1);
+                    let code = child
+                        .wait()
+                        .ok()
+                        .and_then(|status| status.code())
+                        .unwrap_or(1);
                     UPDATE_RUNNING.store(false, Ordering::Release);
                     // SAFETY: the window identifier is restored to the handle
                     // supplied by the UI thread. A destroyed window makes the
@@ -72,14 +80,15 @@ fn spawn_updater() -> io::Result<Child> {
         .duration_since(UNIX_EPOCH)
         .map_err(io::Error::other)?
         .as_nanos();
-    let directory = std::env::temp_dir().join(format!(
-        "brightwheel-update-{}-{nonce}",
-        std::process::id()
-    ));
+    let directory =
+        std::env::temp_dir().join(format!("brightwheel-update-{}-{nonce}", std::process::id()));
     fs::create_dir(&directory)?;
     let script = directory.join("updater.ps1");
     let write_result = (|| {
-        let mut output = OpenOptions::new().write(true).create_new(true).open(&script)?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&script)?;
         output.write_all(include_str!("../../scripts/windows-updater.ps1").as_bytes())?;
         output.sync_all()
     })();
