@@ -11,11 +11,12 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    FindWindowExW, HC_ACTION, HICON, HWND_MESSAGE, IDI_APPLICATION, LoadCursorW, LoadIconW, MSG,
-    MSLLHOOKSTRUCT, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetWindowsHookExW,
-    TranslateMessage, WH_MOUSE_LL, WM_APP, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP, WM_MBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONUP, WNDCLASSW,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    FindWindowExW, GetMessageW, HC_ACTION, HICON, HWND_MESSAGE, IDI_APPLICATION, LoadCursorW,
+    LoadIconW, MSG, MSLLHOOKSTRUCT, PostMessageW, PostQuitMessage, RegisterClassW,
+    RegisterWindowMessageW, SetWindowsHookExW, TranslateMessage, WH_MOUSE_LL, WM_APP,
+    WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_RBUTTONUP, WNDCLASSW,
 };
 
 use super::gesture::{
@@ -97,7 +98,12 @@ pub(crate) fn request_running_instance_exit() -> Result<(), Box<dyn Error>> {
     // SAFETY: HWND_MESSAGE restricts the search to message-only windows;
     // both class and title strings are terminated and valid for the call.
     let window = unsafe {
-        FindWindowExW(HWND_MESSAGE, ptr::null_mut(), class_name.as_ptr(), window_title.as_ptr())
+        FindWindowExW(
+            HWND_MESSAGE,
+            ptr::null_mut(),
+            class_name.as_ptr(),
+            window_title.as_ptr(),
+        )
     };
     if window.is_null() {
         return Err("running BrightWheel window was not found".into());
