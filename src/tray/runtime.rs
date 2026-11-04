@@ -12,8 +12,8 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    HC_ACTION, HICON, HWND_MESSAGE, IDI_APPLICATION, LoadCursorW, LoadIconW, MSG, MSLLHOOKSTRUCT,
-    PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetWindowsHookExW,
+    FindWindowExW, HC_ACTION, HICON, HWND_MESSAGE, IDI_APPLICATION, LoadCursorW, LoadIconW, MSG,
+    MSLLHOOKSTRUCT, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetWindowsHookExW,
     TranslateMessage, WH_MOUSE_LL, WM_APP, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP, WM_MBUTTONUP,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONUP, WNDCLASSW,
 };
@@ -23,6 +23,7 @@ use super::gesture::{
 };
 use super::platform::{MouseHook, SingleInstance, power_off_monitors, show_error, wide};
 use super::tray_icon::{self, MenuCommand, Status};
+use super::updater;
 
 const WINDOW_CLASS: &str = "BrightWheel.HiddenWindow";
 const WINDOW_TITLE: &str = "BrightWheel";
@@ -31,6 +32,8 @@ const ICON_RESOURCE_ID: usize = 1;
 const BRIGHTNESS_UPDATED: u32 = WM_APP + 2;
 const TOGGLE_HDR: u32 = WM_APP + 3;
 const POWER_OFF_MONITORS: u32 = WM_APP + 4;
+const EXIT_FOR_UPDATE: u32 = WM_APP + 5;
+pub(super) const UPDATE_RESULT: u32 = WM_APP + 6;
 const BATCH_WINDOW: Duration = Duration::from_millis(40);
 
 static STATE: SharedState = SharedState::new();
@@ -85,6 +88,25 @@ impl SharedState {
         self.interaction_active.store(false, Ordering::Relaxed);
         self.wheel_generation.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Ask the existing message-only window to terminate without starting a second tray instance.
+pub(crate) fn request_running_instance_exit() -> Result<(), Box<dyn Error>> {
+    let class_name = wide(WINDOW_CLASS);
+    let window_title = wide(WINDOW_TITLE);
+    // SAFETY: HWND_MESSAGE restricts the search to message-only windows;
+    // both class and title strings are terminated and valid for the call.
+    let window = unsafe {
+        FindWindowExW(HWND_MESSAGE, ptr::null_mut(), class_name.as_ptr(), window_title.as_ptr())
+    };
+    if window.is_null() {
+        return Err("running BrightWheel window was not found".into());
+    }
+    // SAFETY: this is a private application message without pointers.
+    if unsafe { PostMessageW(window, EXIT_FOR_UPDATE, 0, 0) } == 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
 }
 
 pub(crate) fn run() -> Result<(), Box<dyn Error>> {
@@ -279,6 +301,26 @@ unsafe extern "system" fn window_proc(
             }
             0
         }
+        EXIT_FOR_UPDATE => {
+            // SAFETY: a live message-only window is destroyed on its owner
+            // thread, which cleans up the tray icon and message loop.
+            unsafe {
+                DestroyWindow(window);
+            }
+            0
+        }
+        UPDATE_RESULT => {
+            match wparam {
+                10 => tray_icon::notify(window, "BrightWheel", "Already up to date"),
+                0 => {}
+                _ => tray_icon::notify(
+                    window,
+                    "BrightWheel update failed",
+                    "See %LOCALAPPDATA%\\BrightWheel\\updater.log",
+                ),
+            }
+            0
+        }
         WM_DESTROY => {
             tray_icon::remove(window);
             STATE.window.store(0, Ordering::Release);
@@ -418,6 +460,7 @@ fn show_context_menu(window: HWND) {
                 show_error(&error.to_string());
             }
         }
+        Ok(Some(MenuCommand::CheckUpdates)) => updater::start(window),
         Ok(Some(MenuCommand::Exit)) => {
             // SAFETY: `window` is the current live message window.
             unsafe {

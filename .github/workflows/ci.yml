@@ -37,6 +37,16 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Validate updater PowerShell syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path scripts/windows-updater.ps1), [ref]$tokens, [ref]$errors
+          ) | Out-Null
+          if ($errors) { throw ($errors | Out-String) }
+
       - name: Run Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 

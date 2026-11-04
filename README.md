@@ -10,7 +10,9 @@ From the tray icon you can:
 - scroll to change the primary monitor's brightness;
 - double-click to turn off all monitors immediately;
 - middle-click to toggle HDR;
-- enable or disable startup with Windows, or exit the app.
+- enable or disable startup with Windows;
+- check for a new release, update in place, and automatically restart;
+- exit the app.
 
 Scrolling accelerates from precise 2% steps to 10% steps during a continuous
 gesture. Startup with Windows is enabled on first launch and can be disabled
@@ -28,6 +30,24 @@ Download `brightwheel.exe` from the
 [latest release](https://github.com/qqrm/brightwheel/releases/latest) and run it.
 The executable is self-contained, but unsigned releases may trigger a Windows
 SmartScreen warning on first launch.
+
+### Updating without manually exiting
+
+Right-click the tray icon and select **Check for updates**. BrightWheel checks
+the latest stable GitHub Release and, if it is newer, downloads and verifies
+its executable assets against GitHub's SHA-256 digests and byte sizes.
+A detached PowerShell helper then asks the running tray process to exit,
+replaces `brightwheel.exe` (and the optional co-located `bright.exe` CLI),
+and restarts the tray. The previous executables are preserved for rollback
+if replacement or restart fails.
+
+The updater requires Windows PowerShell 5.1, HTTPS access to GitHub, and
+write access to the installation directory. It is manually initiated and
+does not periodically check for updates. The local update log is at
+`%LOCALAPPDATA%\BrightWheel\updater.log`. No monitor data is uploaded.
+
+When installing with `cargo install brightwheel --force` instead, a running
+executable still needs to be closed before Cargo can overwrite it.
 
 Alternatively, install both the tray app and CLI with Rust:
 
