@@ -6,9 +6,9 @@ use std::ptr;
 
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
 use windows_sys::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
-    NOTIFYICON_VERSION_4, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect,
-    Shell_NotifyIconW,
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
+    NIM_MODIFY, NIM_SETVERSION, NOTIFYICON_VERSION_4, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER,
+    Shell_NotifyIconGetRect, Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, HICON, HMENU, MF_CHECKED,
@@ -24,10 +24,12 @@ pub(crate) const CALLBACK_MESSAGE: u32 = WM_APP + 1;
 const ICON_ID: u32 = 1;
 const MENU_AUTOSTART: usize = 1001;
 const MENU_EXIT: usize = 1002;
+const MENU_UPDATE: usize = 1003;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MenuCommand {
     ToggleAutostart,
+    CheckUpdates,
     Exit,
 }
 
@@ -77,6 +79,19 @@ pub(crate) fn update(window: HWND, icon: HICON, status: Status) {
     }
 }
 
+pub(crate) fn notify(window: HWND, title: &str, message: &str) {
+    let mut data = data(window);
+    data.uFlags = NIF_INFO;
+    data.dwInfoFlags = NIIF_INFO;
+    copy_wide(&mut data.szInfoTitle, title);
+    copy_wide(&mut data.szInfo, message);
+    // SAFETY: data contains valid fixed-length UTF-16 strings and identifies
+    // the existing notification-area icon.
+    unsafe {
+        Shell_NotifyIconW(NIM_MODIFY, &data);
+    }
+}
+
 pub(crate) fn remove(window: HWND) {
     let data = data(window);
     // SAFETY: `data` identifies the icon associated with this window.
@@ -114,6 +129,8 @@ pub(crate) fn context_menu(
     };
     menu.append(MF_STRING | check_flag, MENU_AUTOSTART, "Start with Windows")?;
     menu.append_separator()?;
+    menu.append(MF_STRING, MENU_UPDATE, "Check for updates")?;
+    menu.append_separator()?;
     menu.append(MF_STRING, MENU_EXIT, "Exit")?;
 
     // SAFETY: `window` is the live message window that owns this menu.
@@ -147,6 +164,7 @@ pub(crate) fn context_menu(
 
     Ok(match command {
         MENU_AUTOSTART => Some(MenuCommand::ToggleAutostart),
+        MENU_UPDATE => Some(MenuCommand::CheckUpdates),
         MENU_EXIT => Some(MenuCommand::Exit),
         _ => None,
     })
