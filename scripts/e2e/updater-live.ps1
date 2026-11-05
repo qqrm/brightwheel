@@ -90,6 +90,44 @@ try {
     }
     Write-Host 'PASS: no-update check preserves running process and executable'
 
+    # Force a failure midway through a multi-file update. The running tray
+    # binary must be restored when a separate process locks the optional CLI.
+    if ($optionalCli) {
+        $cliFile = Join-Path $install 'bright.exe'
+        $cliBefore = (Get-FileHash -LiteralPath $cliFile -Algorithm SHA256).Hash
+        $lock = [IO.File]::Open(
+            $cliFile,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::None
+        )
+        try {
+            $failureCode = Run-Updater '0.0.0' $process.Id
+            if ($failureCode -eq 0) {
+                throw 'Updater unexpectedly succeeded while the CLI file was locked'
+            }
+            if (-not $process.WaitForExit(20000)) {
+                throw 'Old tray process remained running after forced replacement failure'
+            }
+        } finally {
+            $lock.Dispose()
+        }
+        if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -cne $before) {
+            throw 'Rollback failed to restore original tray executable'
+        }
+        if ((Get-FileHash -LiteralPath $cliFile -Algorithm SHA256).Hash -cne $cliBefore) {
+            throw 'Failure mutated the locked CLI executable'
+        }
+        $restartedOld = @(Get-Process -Name $processName -ErrorAction SilentlyContinue | Where-Object {
+            try { $_.Path -ieq $target } catch { $false }
+        })
+        if ($restartedOld.Count -ne 1) {
+            throw "Rollback did not restart exactly one old tray instance: $($restartedOld.Count)"
+        }
+        $process = $restartedOld[0]
+        Write-Host 'PASS: locked-CLI failure restored original tray, kept CLI, and restarted old process'
+    }
+
     # Force a controlled version comparison, without modifying the compiled app,
     # so a previously published real release can exercise replacement in CI.
     $updateCode = Run-Updater '0.0.0' $process.Id
