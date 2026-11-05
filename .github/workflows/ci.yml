@@ -65,6 +65,27 @@ jobs:
       - name: Verify crate package
         run: cargo publish --dry-run --locked
 
+  updater-live:
+    name: Live updater E2E
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Build both production binaries
+        run: cargo build --release --locked
+      - name: Live upgrade and no-op behavior
+        shell: pwsh
+        run: ./scripts/e2e/updater-live.ps1 -Application brightwheel
+
   dependency-security:
     name: Dependency security
     runs-on: windows-latest
