@@ -29,7 +29,7 @@ use super::updater;
 const WINDOW_CLASS: &str = "BrightWheel.HiddenWindow";
 const WINDOW_TITLE: &str = "BrightWheel";
 const INSTANCE_MUTEX: &str = "Local\\BrightWheel.Singleton";
-const ICON_RESOURCE_ID: usize = 1;
+const BULB_ICON_RESOURCE_ID: usize = 2;
 const BRIGHTNESS_UPDATED: u32 = WM_APP + 2;
 const TOGGLE_HDR: u32 = WM_APP + 3;
 const POWER_OFF_MONITORS: u32 = WM_APP + 4;
@@ -136,6 +136,7 @@ pub(crate) fn run(skip_startup_update: bool) -> Result<(), Box<dyn Error>> {
     let window_class = WNDCLASSW {
         lpfnWndProc: Some(window_proc),
         hInstance: module,
+        hIcon: tray_icon::application_icon(),
         // SAFETY: the standard arrow cursor is a process-independent resource.
         hCursor: unsafe { LoadCursorW(ptr::null_mut(), 32512_u16 as *const u16) },
         lpszClassName: class_name.as_ptr(),
@@ -146,8 +147,9 @@ pub(crate) fn run(skip_startup_update: bool) -> Result<(), Box<dyn Error>> {
         return Err(io::Error::last_os_error().into());
     }
 
-    // SAFETY: resource ID 1 is linked into the current executable.
-    let icon = unsafe { LoadIconW(module, ICON_RESOURCE_ID as *const u16) };
+    // SAFETY: resource ID 2 contains the bare bulb for dynamic tray rendering.
+    // Resource 1 is the fixed application icon, with all five dots already drawn.
+    let icon = unsafe { LoadIconW(module, BULB_ICON_RESOURCE_ID as *const u16) };
     let icon = if icon.is_null() {
         // SAFETY: the standard application icon is a process-independent resource.
         unsafe { LoadIconW(ptr::null_mut(), IDI_APPLICATION) }
@@ -477,7 +479,12 @@ fn show_context_menu(window: HWND) {
     let autostart_enabled = brightwheel::autostart::is_enabled().unwrap_or(false);
     let automatic_updates_enabled =
         brightwheel::settings::automatic_updates_enabled().unwrap_or(false);
-    match tray_icon::context_menu(window, autostart_enabled, automatic_updates_enabled) {
+    match tray_icon::context_menu(
+        window,
+        autostart_enabled,
+        automatic_updates_enabled,
+        updater::is_running(),
+    ) {
         Ok(Some(MenuCommand::ToggleAutostart)) => {
             if let Err(error) = brightwheel::autostart::set_enabled(!autostart_enabled) {
                 show_error(&error.to_string());

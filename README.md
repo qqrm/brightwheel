@@ -38,6 +38,11 @@ BrightWheel checks for updates in the background on every normal launch by
 default. The **Check for updates automatically** checkbox in the tray menu
 saves your preference; disabling it stops checks on subsequent launches.
 **Check for updates** remains available for a manual check at any time.
+While a check is running, that menu item becomes **Checking for updates...**
+and is disabled. Manual checks show a notification only for the final result;
+there is no separate progress notification left in Windows notification history.
+Notifications use the **BrightWheel** application name and the fixed full-brightness
+icon with five dots. The tray icon continues to reflect the current brightness.
 
 BrightWheel checks the latest stable GitHub Release and, if it is newer,
 downloads and verifies its executable assets against GitHub's SHA-256 digests

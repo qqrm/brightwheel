@@ -15,7 +15,8 @@ const MINIMUM_GLOW: (u8, u8, u8) = (160, 136, 48);
 const ON: (u8, u8, u8) = (255, 212, 59);
 const SOCKET: (u8, u8, u8) = (0, 0, 0);
 
-/// An application-owned, colorized copy of the original application icon.
+/// An application-owned tray icon rendered from the unadorned bulb resource.
+/// The fixed application icon already has five dots and must not be used here.
 pub(crate) struct BrightnessIcon(HICON);
 
 impl BrightnessIcon {
