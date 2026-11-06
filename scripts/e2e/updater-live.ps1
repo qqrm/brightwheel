@@ -70,10 +70,21 @@ function Assert-Asset([object]$release, [string]$filename) {
     Write-Host "$filename matches published $($release.tag_name) SHA-256 and length"
 }
 
+function Assert-RestartSkipsCheck([int]$processId) {
+    $details = Get-CimInstance Win32_Process -Filter "ProcessId = $processId"
+    if ($null -eq $details -or $details.CommandLine -notmatch '(?:^|\s)--skip-startup-update(?:\s|$)') {
+        throw 'Updater restart did not suppress the next automatic check'
+    }
+}
+
 try {
     $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repository/releases/latest" -Headers @{'User-Agent'='Windows-Updater-E2E'} -TimeoutSec 40
     Write-Host "Testing $Application against real release $($release.tag_name)"
-    $process = Start-Process -FilePath $target -WorkingDirectory $install -PassThru
+    $start = @{ FilePath = $target; WorkingDirectory = $install; PassThru = $true }
+    # This script controls helper invocations explicitly; startup checks have
+    # their own E2E and must not race with the forced version comparisons here.
+    if ($optionalCli) { $start.ArgumentList = '--skip-startup-update' }
+    $process = Start-Process @start
     Start-Sleep -Seconds 3
     if ($process.HasExited) { throw "$binary terminated unexpectedly on startup" }
 
@@ -125,6 +136,7 @@ try {
             throw "Rollback did not restart exactly one old tray instance: $($restartedOld.Count)"
         }
         $process = $restartedOld[0]
+        Assert-RestartSkipsCheck $process.Id
         Write-Host 'PASS: locked-CLI failure restored original tray, kept CLI, and restarted old process'
     }
 
@@ -150,6 +162,7 @@ try {
         Start-Sleep -Milliseconds 500
     }
     if ($replacement.Count -eq 0) { throw 'Replacement executable was not restarted' }
+    if ($optionalCli) { Assert-RestartSkipsCheck $replacement[0].Id }
 
     $backups = @(Get-ChildItem -LiteralPath $install -File -Filter '*backup*')
     if ($backups.Count -gt 0) {

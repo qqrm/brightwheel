@@ -11,6 +11,7 @@ From the tray icon you can:
 - double-click to turn off all monitors immediately;
 - middle-click to toggle HDR;
 - enable or disable startup with Windows;
+- enable or disable automatic update checks at startup;
 - check for a new release, update in place, and automatically restart;
 - exit the app.
 
@@ -33,17 +34,26 @@ SmartScreen warning on first launch.
 
 ### Updating without manually exiting
 
-Right-click the tray icon and select **Check for updates**. BrightWheel checks
-the latest stable GitHub Release and, if it is newer, downloads and verifies
-its executable assets against GitHub's SHA-256 digests and byte sizes.
+BrightWheel checks for updates in the background on every normal launch by
+default. The **Check for updates automatically** checkbox in the tray menu
+saves your preference; disabling it stops checks on subsequent launches.
+**Check for updates** remains available for a manual check at any time.
+
+BrightWheel checks the latest stable GitHub Release and, if it is newer,
+downloads and verifies its executable assets against GitHub's SHA-256 digests
+and byte sizes.
 A detached PowerShell helper then asks the running tray process to exit,
 replaces `brightwheel.exe` (and the optional co-located `bright.exe` CLI),
 and restarts the tray. The previous executables are preserved for rollback
 if replacement or restart fails.
 
 The updater requires Windows PowerShell 5.1, HTTPS access to GitHub, and
-write access to the installation directory. It is manually initiated and
-does not periodically check for updates. The local update log is at
+write access to the installation directory. Automatic startup checks do not show
+notifications for checking, no update, or network errors, and never block the
+tray UI. There is no periodic polling. After an update or rollback, the helper
+skips the startup check for that restart to avoid repeated update attempts; the
+next normal launch checks again. Changing the checkbox does not cancel a check
+already in progress. The local update log is at
 `%LOCALAPPDATA%\BrightWheel\updater.log`. No monitor data is uploaded.
 
 When installing with `cargo install brightwheel --force` instead, a running

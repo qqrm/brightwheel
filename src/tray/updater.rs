@@ -22,59 +22,96 @@ use super::{runtime::UPDATE_RESULT, tray_icon};
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 static UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
 
-pub(super) fn start(window: HWND) {
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum CheckMode {
+    Automatic,
+    Manual,
+}
+
+pub(super) fn start(window: HWND, mode: CheckMode) {
+    let notify = mode == CheckMode::Manual;
     if cfg!(debug_assertions) {
-        tray_icon::notify(
-            window,
-            "BrightWheel",
-            "Use a release build to check for updates",
-        );
+        if notify {
+            tray_icon::notify(
+                window,
+                "BrightWheel",
+                "Use a release build to check for updates",
+            );
+        }
         return;
     }
     if UPDATE_RUNNING.swap(true, Ordering::AcqRel) {
-        tray_icon::notify(window, "BrightWheel", "An update check is already running");
+        if notify {
+            tray_icon::notify(window, "BrightWheel", "An update check is already running");
+        }
         return;
     }
 
-    match spawn_updater() {
-        Ok(mut child) => {
-            tray_icon::notify(window, "BrightWheel", "Checking for updates");
-            let window_id = window as usize;
-            if thread::Builder::new()
-                .name("brightwheel-update-monitor".into())
-                .spawn(move || {
-                    let code = child
-                        .wait()
-                        .ok()
-                        .and_then(|status| status.code())
-                        .unwrap_or(1);
-                    UPDATE_RUNNING.store(false, Ordering::Release);
-                    // SAFETY: the window identifier is restored to the handle
-                    // supplied by the UI thread. A destroyed window makes the
-                    // post fail harmlessly.
-                    unsafe {
-                        PostMessageW(window_id as HWND, UPDATE_RESULT, code as usize, 0);
-                    }
-                })
-                .is_err()
-            {
-                UPDATE_RUNNING.store(false, Ordering::Release);
-            }
-        }
-        Err(error) => {
+    let window_id = window as usize;
+    let worker = thread::Builder::new()
+        .name("brightwheel-update-monitor".into())
+        .spawn(move || {
+            // Start the worker before the helper, so thread-creation failure
+            // cannot leave an unmonitored updater running with the guard clear.
+            // File I/O and process creation also stay off the UI thread.
+            let code = match spawn_updater().and_then(|mut child| child.wait()) {
+                Ok(status) => status.code().unwrap_or(1),
+                Err(error) => {
+                    log_launch_error(&error);
+                    1
+                }
+            };
             UPDATE_RUNNING.store(false, Ordering::Release);
+            if notify {
+                // SAFETY: the window identifier is restored to the handle
+                // supplied by the UI thread. A destroyed window makes the
+                // post fail harmlessly.
+                unsafe {
+                    PostMessageW(window_id as HWND, UPDATE_RESULT, code as usize, 0);
+                }
+            }
+        });
+    if let Err(error) = worker {
+        UPDATE_RUNNING.store(false, Ordering::Release);
+        log_launch_error(&error);
+        if notify {
             tray_icon::notify(window, "BrightWheel update failed", &error.to_string());
         }
+    } else if notify {
+        tray_icon::notify(window, "BrightWheel", "Checking for updates");
     }
 }
 
-fn spawn_updater() -> io::Result<Child> {
-    let target = std::env::current_exe()?;
+fn update_log_path() -> io::Result<PathBuf> {
     let local_app_data = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA is unavailable"))?;
-    let log_path = local_app_data.join("BrightWheel").join("updater.log");
+    Ok(local_app_data.join("BrightWheel").join("updater.log"))
+}
+
+fn log_launch_error(error: &io::Error) {
+    let _ = (|| -> io::Result<()> {
+        let log_path = update_log_path()?;
+        if let Some(directory) = log_path.parent() {
+            fs::create_dir_all(directory)?;
+        }
+        let mut log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)?;
+        writeln!(log, "[launcher] Update check failed: {error}")
+    })();
+}
+
+fn spawn_updater() -> io::Result<Child> {
+    let target = std::env::current_exe()?;
+    let log_path = update_log_path()?;
+    let system_root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "SystemRoot is unavailable"))?;
+    let powershell = system_root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
 
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -97,11 +134,6 @@ fn spawn_updater() -> io::Result<Child> {
         return Err(error);
     }
 
-    let system_root = std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "SystemRoot is unavailable"))?;
-    let powershell = system_root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
     let child = Command::new(powershell)
         .arg("-NoLogo")
         .arg("-NoProfile")

@@ -7,12 +7,15 @@
 
 mod ddc;
 mod error;
+mod registry;
 mod wide;
 
 /// Per-user Windows autostart configuration.
 pub mod autostart;
 /// HDR state for the primary Windows display.
 pub mod hdr;
+/// Persistent preferences for the current Windows user.
+pub mod settings;
 
 pub use ddc::{BRIGHTNESS_VCP_CODE, Brightness, MonitorInfo, capabilities, change, get, list, set};
 pub use error::{DdcError, Result};
