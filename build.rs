@@ -1,4 +1,4 @@
-//! Compiles the Windows icon resource into the `BrightWheel` tray executable.
+//! Compiles Windows icons and application metadata into the tray executable.
 
 use std::env;
 use std::fs;
@@ -7,6 +7,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=assets/brightwheel.ico");
+    println!("cargo:rerun-if-changed=assets/brightwheel-bulb.ico");
     println!("cargo:rerun-if-changed=assets/brightwheel.rc");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
@@ -14,7 +15,9 @@ fn main() {
     }
 
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("brightwheel.res");
+    let output_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    write_version_header(&output_dir);
+    let output = output_dir.join("brightwheel.res");
     let compiler = find_resource_compiler().unwrap_or_else(|| {
         panic!("Windows SDK resource compiler rc.exe was not found");
     });
@@ -22,6 +25,8 @@ fn main() {
     let status = Command::new(&compiler)
         .current_dir(manifest_dir.join("assets"))
         .arg("/nologo")
+        .arg("/i")
+        .arg(&output_dir)
         .arg("/fo")
         .arg(&output)
         .arg("brightwheel.rc")
@@ -30,6 +35,28 @@ fn main() {
     assert!(status.success(), "rc.exe failed with status {status}");
 
     println!("cargo:rustc-link-arg-bin=brightwheel={}", output.display());
+}
+
+fn write_version_header(output_dir: &Path) {
+    let version = env::var("CARGO_PKG_VERSION").unwrap();
+    let [major, minor, patch] = ["MAJOR", "MINOR", "PATCH"].map(|part| {
+        env::var(format!("CARGO_PKG_VERSION_{part}"))
+            .unwrap()
+            .parse::<u16>()
+            .expect("Windows version components must fit in 16 bits")
+    });
+    let flags = if env::var("CARGO_PKG_VERSION_PRE").unwrap().is_empty() {
+        0
+    } else {
+        0x2 // VS_FF_PRERELEASE
+    };
+    let header = format!(
+        "#define BRIGHTWHEEL_VERSION_NUMERIC {major},{minor},{patch},0\n\
+         #define BRIGHTWHEEL_VERSION_STRING \"{version}\\0\"\n\
+         #define BRIGHTWHEEL_VERSION_FLAGS {flags}\n"
+    );
+    fs::write(output_dir.join("brightwheel-version.h"), header)
+        .expect("failed to write Windows version resource header");
 }
 
 fn find_resource_compiler() -> Option<PathBuf> {

@@ -28,6 +28,10 @@ pub(super) enum CheckMode {
     Manual,
 }
 
+pub(super) fn is_running() -> bool {
+    UPDATE_RUNNING.load(Ordering::Acquire)
+}
+
 pub(super) fn start(window: HWND, mode: CheckMode) {
     let notify = mode == CheckMode::Manual;
     if cfg!(debug_assertions) {
@@ -41,9 +45,6 @@ pub(super) fn start(window: HWND, mode: CheckMode) {
         return;
     }
     if UPDATE_RUNNING.swap(true, Ordering::AcqRel) {
-        if notify {
-            tray_icon::notify(window, "BrightWheel", "An update check is already running");
-        }
         return;
     }
 
@@ -77,8 +78,6 @@ pub(super) fn start(window: HWND, mode: CheckMode) {
         if notify {
             tray_icon::notify(window, "BrightWheel update failed", &error.to_string());
         }
-    } else if notify {
-        tray_icon::notify(window, "BrightWheel", "Checking for updates");
     }
 }
 

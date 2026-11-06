@@ -82,6 +82,9 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build both production binaries
         run: cargo build --release --locked
+      - name: Verify application identity
+        shell: pwsh
+        run: ./scripts/e2e/application-identity.ps1
       - name: Automatic update startup preferences
         shell: pwsh
         run: ./scripts/e2e/startup-updates.ps1

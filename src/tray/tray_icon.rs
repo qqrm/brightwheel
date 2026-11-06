@@ -5,15 +5,16 @@ use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
-    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
-    NIM_MODIFY, NIM_SETVERSION, NOTIFYICON_VERSION_4, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER,
-    Shell_NotifyIconGetRect, Shell_NotifyIconW,
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIIF_LARGE_ICON, NIIF_USER,
+    NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICON_VERSION_4, NOTIFYICONDATAW,
+    NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect, Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, HICON, HMENU, MF_CHECKED,
-    MF_SEPARATOR, MF_STRING, MF_UNCHECKED, PostMessageW, SetForegroundWindow, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP, WM_NULL,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, HICON, HMENU, LoadIconW, MF_CHECKED,
+    MF_GRAYED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, PostMessageW, SetForegroundWindow,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP, WM_NULL,
 };
 
 use super::brightness_icon::BrightnessIcon;
@@ -22,6 +23,7 @@ use super::platform::wide;
 pub(crate) const CALLBACK_MESSAGE: u32 = WM_APP + 1;
 
 const ICON_ID: u32 = 1;
+const APPLICATION_ICON_RESOURCE_ID: usize = 1;
 const MENU_AUTOSTART: usize = 1001;
 const MENU_EXIT: usize = 1002;
 const MENU_UPDATE: usize = 1003;
@@ -39,6 +41,18 @@ pub(crate) enum MenuCommand {
 pub(crate) struct Status {
     pub(crate) brightness: Option<u32>,
     pub(crate) hdr: Option<bool>,
+}
+
+pub(crate) fn application_icon() -> HICON {
+    // SAFETY: a null module name selects this executable, which embeds the
+    // fixed five-dot application icon as resource 1. LoadIconW returns a shared
+    // resource handle that remains valid for queued notifications.
+    unsafe {
+        LoadIconW(
+            GetModuleHandleW(ptr::null()),
+            APPLICATION_ICON_RESOURCE_ID as *const u16,
+        )
+    }
 }
 
 pub(crate) fn add(window: HWND, icon: HICON, status: Status) -> io::Result<()> {
@@ -84,7 +98,12 @@ pub(crate) fn update(window: HWND, icon: HICON, status: Status) {
 pub(crate) fn notify(window: HWND, title: &str, message: &str) {
     let mut data = data(window);
     data.uFlags = NIF_INFO;
-    data.dwInfoFlags = NIIF_INFO;
+    data.hBalloonIcon = application_icon();
+    data.dwInfoFlags = if data.hBalloonIcon.is_null() {
+        NIIF_INFO
+    } else {
+        NIIF_USER | NIIF_LARGE_ICON
+    };
     copy_wide(&mut data.szInfoTitle, title);
     copy_wide(&mut data.szInfo, message);
     // SAFETY: data contains valid fixed-length UTF-16 strings and identifies
@@ -123,6 +142,7 @@ pub(crate) fn context_menu(
     window: HWND,
     autostart_enabled: bool,
     automatic_updates_enabled: bool,
+    update_running: bool,
 ) -> io::Result<Option<MenuCommand>> {
     let menu = Menu::create()?;
     let check_flag = if autostart_enabled {
@@ -142,7 +162,15 @@ pub(crate) fn context_menu(
         MENU_AUTO_UPDATE,
         "Check for updates automatically",
     )?;
-    menu.append(MF_STRING, MENU_UPDATE, "Check for updates")?;
+    if update_running {
+        menu.append(
+            MF_STRING | MF_GRAYED,
+            MENU_UPDATE,
+            "Checking for updates...",
+        )?;
+    } else {
+        menu.append(MF_STRING, MENU_UPDATE, "Check for updates")?;
+    }
     menu.append_separator()?;
     menu.append(MF_STRING, MENU_EXIT, "Exit")?;
 

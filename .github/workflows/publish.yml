@@ -88,6 +88,10 @@ jobs:
       - name: Build release binaries
         run: cargo build --release --locked
 
+      - name: Verify application identity
+        shell: pwsh
+        run: ./scripts/e2e/application-identity.ps1
+
       - name: Package release assets
         id: assets
         shell: pwsh
