@@ -35,6 +35,7 @@ const TOGGLE_HDR: u32 = WM_APP + 3;
 const POWER_OFF_MONITORS: u32 = WM_APP + 4;
 const EXIT_FOR_UPDATE: u32 = WM_APP + 5;
 pub(super) const UPDATE_RESULT: u32 = WM_APP + 6;
+const STARTUP_UPDATE: u32 = WM_APP + 7;
 const BATCH_WINDOW: Duration = Duration::from_millis(40);
 
 static STATE: SharedState = SharedState::new();
@@ -115,7 +116,7 @@ pub(crate) fn request_running_instance_exit() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-pub(crate) fn run() -> Result<(), Box<dyn Error>> {
+pub(crate) fn run(skip_startup_update: bool) -> Result<(), Box<dyn Error>> {
     let instance = SingleInstance::acquire(INSTANCE_MUTEX)?;
     if instance.already_running() {
         return Ok(());
@@ -216,6 +217,14 @@ pub(crate) fn run() -> Result<(), Box<dyn Error>> {
         return Err(io::Error::last_os_error().into());
     }
     let _hook = MouseHook::from_raw(hook);
+
+    if !skip_startup_update {
+        // SAFETY: initialization succeeded and `window` belongs to this thread.
+        // Queue the check so normal message processing can begin immediately.
+        unsafe {
+            PostMessageW(window, STARTUP_UPDATE, 0, 0);
+        }
+    }
 
     run_message_loop()?;
     drop(instance);
@@ -324,6 +333,12 @@ unsafe extern "system" fn window_proc(
                     "BrightWheel update failed",
                     "See %LOCALAPPDATA%\\BrightWheel\\updater.log",
                 ),
+            }
+            0
+        }
+        STARTUP_UPDATE => {
+            if brightwheel::settings::automatic_updates_enabled().unwrap_or(false) {
+                updater::start(window, updater::CheckMode::Automatic);
             }
             0
         }
@@ -460,13 +475,22 @@ fn brightness_worker(receiver: Receiver<WheelEvent>) {
 
 fn show_context_menu(window: HWND) {
     let autostart_enabled = brightwheel::autostart::is_enabled().unwrap_or(false);
-    match tray_icon::context_menu(window, autostart_enabled) {
+    let automatic_updates_enabled =
+        brightwheel::settings::automatic_updates_enabled().unwrap_or(false);
+    match tray_icon::context_menu(window, autostart_enabled, automatic_updates_enabled) {
         Ok(Some(MenuCommand::ToggleAutostart)) => {
             if let Err(error) = brightwheel::autostart::set_enabled(!autostart_enabled) {
                 show_error(&error.to_string());
             }
         }
-        Ok(Some(MenuCommand::CheckUpdates)) => updater::start(window),
+        Ok(Some(MenuCommand::ToggleAutomaticUpdates)) => {
+            if let Err(error) =
+                brightwheel::settings::set_automatic_updates_enabled(!automatic_updates_enabled)
+            {
+                show_error(&error.to_string());
+            }
+        }
+        Ok(Some(MenuCommand::CheckUpdates)) => updater::start(window, updater::CheckMode::Manual),
         Ok(Some(MenuCommand::Exit)) => {
             // SAFETY: `window` is the current live message window.
             unsafe {

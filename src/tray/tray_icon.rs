@@ -25,10 +25,12 @@ const ICON_ID: u32 = 1;
 const MENU_AUTOSTART: usize = 1001;
 const MENU_EXIT: usize = 1002;
 const MENU_UPDATE: usize = 1003;
+const MENU_AUTO_UPDATE: usize = 1004;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MenuCommand {
     ToggleAutostart,
+    ToggleAutomaticUpdates,
     CheckUpdates,
     Exit,
 }
@@ -120,6 +122,7 @@ pub(crate) fn contains(window: HWND, point: POINT) -> bool {
 pub(crate) fn context_menu(
     window: HWND,
     autostart_enabled: bool,
+    automatic_updates_enabled: bool,
 ) -> io::Result<Option<MenuCommand>> {
     let menu = Menu::create()?;
     let check_flag = if autostart_enabled {
@@ -129,6 +132,16 @@ pub(crate) fn context_menu(
     };
     menu.append(MF_STRING | check_flag, MENU_AUTOSTART, "Start with Windows")?;
     menu.append_separator()?;
+    let check_flag = if automatic_updates_enabled {
+        MF_CHECKED
+    } else {
+        MF_UNCHECKED
+    };
+    menu.append(
+        MF_STRING | check_flag,
+        MENU_AUTO_UPDATE,
+        "Check for updates automatically",
+    )?;
     menu.append(MF_STRING, MENU_UPDATE, "Check for updates")?;
     menu.append_separator()?;
     menu.append(MF_STRING, MENU_EXIT, "Exit")?;
@@ -164,6 +177,7 @@ pub(crate) fn context_menu(
 
     Ok(match command {
         MENU_AUTOSTART => Some(MenuCommand::ToggleAutostart),
+        MENU_AUTO_UPDATE => Some(MenuCommand::ToggleAutomaticUpdates),
         MENU_UPDATE => Some(MenuCommand::CheckUpdates),
         MENU_EXIT => Some(MenuCommand::Exit),
         _ => None,

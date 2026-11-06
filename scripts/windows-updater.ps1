@@ -82,6 +82,7 @@ try {
     }
     $directory = Split-Path -Parent $TargetPath
     $current = Read-Version $CurrentVersion
+    Write-UpdateLog "Checking for updates ($CurrentVersion)"
     $headers = @{ 'User-Agent' = 'BrightWheel-Updater' }
     $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/qqrm/brightwheel/releases/latest' -Headers $headers -TimeoutSec 45
     if ($release.draft -or $release.prerelease) {
@@ -137,7 +138,9 @@ try {
         [IO.File]::Move($entry.Candidate, $entry.Target)
     }
 
-    $newProcess = Start-Process -FilePath $TargetPath -WorkingDirectory $directory -PassThru -ErrorAction Stop
+    # Do not re-enter the automatic startup check while this helper is still
+    # committing the update (or repeatedly retry a failed update after rollback).
+    $newProcess = Start-Process -FilePath $TargetPath -ArgumentList '--skip-startup-update' -WorkingDirectory $directory -PassThru -ErrorAction Stop
     if ($newProcess.WaitForExit(1000)) {
         throw "Updated BrightWheel exited immediately"
     }
@@ -165,7 +168,7 @@ try {
         $running = Get-Process -Id $ParentProcessId -ErrorAction SilentlyContinue
         if ($null -eq $running) {
             try {
-                Start-Process -FilePath $TargetPath -ErrorAction Stop
+                Start-Process -FilePath $TargetPath -ArgumentList '--skip-startup-update' -ErrorAction Stop
             } catch {
                 Write-UpdateLog ("Restart failed: " + $_.Exception.Message)
             }
