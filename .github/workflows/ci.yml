@@ -88,6 +88,9 @@ jobs:
       - name: Tray recovery and process replacement
         shell: pwsh
         run: ./scripts/e2e/tray-lifecycle.ps1 -RestartExplorer
+      - name: Update notification and log reader
+        shell: pwsh
+        run: ./scripts/e2e/update-log.ps1
       - name: Automatic update startup preferences
         shell: pwsh
         run: ./scripts/e2e/startup-updates.ps1
