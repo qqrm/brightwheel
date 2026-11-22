@@ -21,6 +21,7 @@ $parentProcess = $null
 $newProcess = $null
 $updateGate = $null
 $gateOwned = $false
+$preserveInstallerStaging = $false
 
 Add-Type -TypeDefinition @'
 using System;
@@ -209,8 +210,21 @@ try {
         $setupLog = "$LogPath.installer.log"
         $arguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-',
             ('/DIR="' + $directory + '"'), ('/LOG="' + $setupLog + '"'))
-        $setup = Start-Process -FilePath $setupPath -ArgumentList $arguments -Wait -PassThru -ErrorAction Stop
-        if ($setup.ExitCode -ne 0) { throw "Installer failed with exit code $($setup.ExitCode)" }
+        $setup = $null
+        try {
+            # Start-Process -Wait also waits for descendants, including the
+            # restarted tray. Hold and wait for only the installer process.
+            $setup = Start-Process -FilePath $setupPath -ArgumentList $arguments -PassThru -ErrorAction Stop
+            $preserveInstallerStaging = $true
+            $null = $setup.Handle
+            if (-not $setup.WaitForExit(180000)) {
+                throw "Installer did not complete within 180 seconds; setup may still be running (PID $($setup.Id))"
+            }
+            $preserveInstallerStaging = $false
+            if ($setup.ExitCode -ne 0) { throw "Installer failed with exit code $($setup.ExitCode)" }
+        } finally {
+            if ($null -ne $setup) { $setup.Dispose() }
+        }
         Assert-Verified $TargetPath $installedAsset
         $registration = Get-InstallerRegistration
         if ($null -eq $registration -or $registration.Version -ne $latest.ToString()) {
@@ -336,5 +350,9 @@ try {
     foreach ($entry in $stagedEntries) {
         Remove-Item -LiteralPath $entry.Candidate -Force -ErrorAction SilentlyContinue
     }
-    Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
+    if ($preserveInstallerStaging) {
+        Write-UpdateLog "Installer may still be running; update staging retained at $workDir"
+    } else {
+        Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
