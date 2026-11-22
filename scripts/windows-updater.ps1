@@ -17,6 +17,36 @@ $stagedEntries = @()
 $rollbackEntries = New-Object 'System.Collections.Generic.List[object]'
 $quitRequested = $false
 $startedNew = $false
+$parentProcess = $null
+$newProcess = $null
+$updateGate = $null
+$gateOwned = $false
+
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class BrightWheelUpdateReady {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Identifier { public uint Size; public IntPtr Window; public uint Id; public Guid Guid; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Rect { public int Left, Top, Right, Bottom; }
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string className, string title);
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr window, out uint pid);
+    [DllImport("shell32.dll")]
+    private static extern int Shell_NotifyIconGetRect(ref Identifier identifier, out Rect rect);
+    public static uint ReadyPid() {
+        var window = FindWindowEx(IntPtr.Zero, IntPtr.Zero, "BrightWheel.HiddenWindow", "BrightWheel");
+        if (window == IntPtr.Zero) return 0;
+        uint pid;
+        GetWindowThreadProcessId(window, out pid);
+        var identifier = new Identifier { Size = (uint)Marshal.SizeOf(typeof(Identifier)), Window = window, Id = 1 };
+        Rect rect;
+        return Shell_NotifyIconGetRect(ref identifier, out rect) == 0 && rect.Right > rect.Left && rect.Bottom > rect.Top ? pid : 0;
+    }
+}
+'@
 
 function Write-UpdateLog([string]$message) {
     try {
@@ -73,6 +103,42 @@ function Assert-Verified([string]$path, [object]$asset) {
     }
 }
 
+function Release-UpdateGate {
+    if ($script:gateOwned) {
+        $script:updateGate.ReleaseMutex()
+        $script:gateOwned = $false
+    }
+}
+
+function Enter-UpdateGate {
+    if ($script:gateOwned) { return }
+    if ($null -eq $script:updateGate) {
+        $script:updateGate = [System.Threading.Mutex]::new($false, 'Local\BrightWheel.Startup')
+    }
+    try { $script:gateOwned = $script:updateGate.WaitOne(10000) }
+    catch [System.Threading.AbandonedMutexException] { $script:gateOwned = $true }
+    if (-not $script:gateOwned) { throw 'Another BrightWheel launch is still starting' }
+}
+
+function Wait-ReadyTray {
+    $deadline = [DateTime]::UtcNow.AddSeconds(20)
+    do {
+        $readyPid = [BrightWheelUpdateReady]::ReadyPid()
+        if ($readyPid -gt 0 -and $readyPid -ne $ParentProcessId) {
+            $ready = Get-Process -Id $readyPid -ErrorAction SilentlyContinue
+            if ($null -ne $ready) {
+                try {
+                    if ([string]::Equals($ready.Path, $TargetPath, [StringComparison]::OrdinalIgnoreCase)) {
+                        return
+                    }
+                } finally { $ready.Dispose() }
+            }
+        }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw 'Updated BrightWheel did not register a usable tray icon'
+}
+
 try {
     if ([IO.Path]::GetFileName($TargetPath) -cne 'brightwheel.exe') {
         throw "Update target must be brightwheel.exe"
@@ -81,6 +147,13 @@ try {
         throw "Invalid running BrightWheel process or executable"
     }
     $directory = Split-Path -Parent $TargetPath
+    # Hold the original process handle across downloads. A user relaunch can
+    # replace it; PID-only lookups afterwards must not target the replacement.
+    $parentProcess = Get-Process -Id $ParentProcessId -ErrorAction Stop
+    $null = $parentProcess.Handle
+    if (-not [string]::Equals($parentProcess.Path, $TargetPath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Updater parent executable does not match its target'
+    }
     $current = Read-Version $CurrentVersion
     Write-UpdateLog "Checking for updates ($CurrentVersion)"
     $headers = @{ 'User-Agent' = 'BrightWheel-Updater' }
@@ -123,12 +196,18 @@ try {
         }
     }
 
+    # Serialize the short destructive phase with user relaunches. Downloads do
+    # not hold the gate; restart readiness must not hold it either.
+    Enter-UpdateGate
+    if ($parentProcess.HasExited) {
+        Write-UpdateLog 'Update cancelled: the original BrightWheel instance was replaced'
+        exit 0
+    }
     Write-UpdateLog "Verified release $tag; requesting graceful shutdown"
     $quitRequested = $true
-    Start-Process -FilePath $TargetPath -ArgumentList '--quit-for-update' -Wait -WindowStyle Hidden -ErrorAction Stop
-    $running = Get-Process -Id $ParentProcessId -ErrorAction SilentlyContinue
-    if ($null -ne $running -and -not $running.WaitForExit(90000)) {
-        throw "BrightWheel did not exit in 90 seconds; originals were not changed"
+    Start-Process -FilePath $TargetPath -ArgumentList "--quit-for-update=$ParentProcessId" -Wait -WindowStyle Hidden -ErrorAction Stop
+    if (-not $parentProcess.WaitForExit(10000)) {
+        throw "BrightWheel did not exit in 10 seconds; originals were not changed"
     }
 
     foreach ($entry in $stagedEntries) {
@@ -140,10 +219,11 @@ try {
 
     # Do not re-enter the automatic startup check while this helper is still
     # committing the update (or repeatedly retry a failed update after rollback).
-    $newProcess = Start-Process -FilePath $TargetPath -ArgumentList '--skip-startup-update' -WorkingDirectory $directory -PassThru -ErrorAction Stop
-    if ($newProcess.WaitForExit(1000)) {
-        throw "Updated BrightWheel exited immediately"
-    }
+    Release-UpdateGate
+    $newProcess = Start-Process -FilePath $TargetPath -ArgumentList '--skip-startup-update', '--skip-if-running' -WorkingDirectory $directory -PassThru -ErrorAction Stop
+    # A user relaunch may win after the gate is released. The internal launch
+    # then exits quietly; either winner must own a real registered tray icon.
+    Wait-ReadyTray
     $startedNew = $true
     Write-UpdateLog "Updated to $tag"
 
@@ -152,6 +232,26 @@ try {
     }
 } catch {
     Write-UpdateLog ("Update failed: " + $_.Exception.Message)
+    if ($rollbackEntries.Count -gt 0 -or $quitRequested) {
+        try { Enter-UpdateGate }
+        catch {
+            Write-UpdateLog 'Rollback deferred: relaunch gate unavailable; backups preserved'
+            exit 1
+        }
+    }
+    if ($null -ne $newProcess -and -not $newProcess.HasExited) {
+        # Stop only our own failed startup before restoring its executable.
+        $newProcess.Kill()
+        $null = $newProcess.WaitForExit(5000)
+    }
+    $userReplacement = @(Get-Process -Name brightwheel -ErrorAction SilentlyContinue | Where-Object {
+        try { $_.Id -ne $ParentProcessId -and [string]::Equals($_.Path, $TargetPath, [StringComparison]::OrdinalIgnoreCase) }
+        catch { $false }
+    })
+    if ($userReplacement.Count -gt 0) {
+        Write-UpdateLog 'Rollback deferred: a user-started replacement is running; backups preserved'
+        exit 1
+    }
     $entries = @($rollbackEntries.ToArray())
     [array]::Reverse($entries)
     foreach ($entry in $entries) {
@@ -165,10 +265,10 @@ try {
         }
     }
     if ($quitRequested -and -not $startedNew -and (Test-Path -LiteralPath $TargetPath -PathType Leaf)) {
-        $running = Get-Process -Id $ParentProcessId -ErrorAction SilentlyContinue
-        if ($null -eq $running) {
+        if ($null -ne $parentProcess -and $parentProcess.HasExited) {
             try {
-                Start-Process -FilePath $TargetPath -ArgumentList '--skip-startup-update' -ErrorAction Stop
+                Release-UpdateGate
+                Start-Process -FilePath $TargetPath -ArgumentList '--skip-startup-update', '--skip-if-running' -ErrorAction Stop
             } catch {
                 Write-UpdateLog ("Restart failed: " + $_.Exception.Message)
             }
@@ -176,6 +276,10 @@ try {
     }
     exit 1
 } finally {
+    Release-UpdateGate
+    if ($null -ne $updateGate) { $updateGate.Dispose() }
+    if ($null -ne $newProcess) { $newProcess.Dispose() }
+    if ($null -ne $parentProcess) { $parentProcess.Dispose() }
     foreach ($entry in $stagedEntries) {
         Remove-Item -LiteralPath $entry.Candidate -Force -ErrorAction SilentlyContinue
     }

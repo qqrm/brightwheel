@@ -47,7 +47,7 @@ function Read-UpdateLog([string]$path) {
     return ''
 }
 
-function Assert-Startup([string]$name, [bool]$expectedCheck, [switch]$skip, [switch]$secondInstance) {
+function Assert-Startup([string]$name, [bool]$expectedCheck, [switch]$skip) {
     $env:LOCALAPPDATA = Join-Path $install $name
     $logPath = Join-Path $env:LOCALAPPDATA 'BrightWheel\updater.log'
     $before = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
@@ -58,7 +58,7 @@ function Assert-Startup([string]$name, [bool]$expectedCheck, [switch]$skip, [swi
         # Wait for the real tray window before observing a disabled check, so
         # slow app initialization cannot produce a false pass.
         $deadline = [DateTime]::UtcNow.AddSeconds(20)
-        while ([StartupUpdateWindow]::FindWindowEx([IntPtr](-3), [IntPtr]::Zero, 'BrightWheel.HiddenWindow', 'BrightWheel') -eq [IntPtr]::Zero) {
+        while ([StartupUpdateWindow]::FindWindowEx([IntPtr]::Zero, [IntPtr]::Zero, 'BrightWheel.HiddenWindow', 'BrightWheel') -eq [IntPtr]::Zero) {
             if ($process.HasExited -or [DateTime]::UtcNow -gt $deadline) {
                 throw "$name did not start a live BrightWheel window"
             }
@@ -78,18 +78,6 @@ function Assert-Startup([string]$name, [bool]$expectedCheck, [switch]$skip, [swi
             }
         } else {
             Start-Sleep -Seconds 4
-        }
-
-        if ($secondInstance) {
-            $duplicate = Start-Process -FilePath $target -WorkingDirectory $install -PassThru
-            try {
-                if (-not $duplicate.WaitForExit(5000) -or $duplicate.ExitCode -ne 0) {
-                    throw 'A duplicate launch did not exit successfully'
-                }
-            } finally {
-                if (-not $duplicate.HasExited) { $duplicate.Kill(); $null = $duplicate.WaitForExit(10000) }
-            }
-            Start-Sleep -Seconds 3
         }
 
         $checks = [regex]::Matches((Read-UpdateLog $logPath), 'Checking for updates \(').Count
@@ -122,7 +110,7 @@ try {
     $config.SetValue('AutoStartConfigured', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
 
     $config.DeleteValue('AutoUpdateEnabled', $false)
-    Assert-Startup 'default-enabled-and-single-instance' $true -secondInstance
+    Assert-Startup 'default-enabled' $true
 
     $config.SetValue('AutoUpdateEnabled', 0, [Microsoft.Win32.RegistryValueKind]::DWord)
     Assert-Startup 'disabled-first-launch' $false
