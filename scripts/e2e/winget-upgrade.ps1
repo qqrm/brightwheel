@@ -3,8 +3,9 @@
 Acceptance test for the actual package-manager path on a disposable Windows VM.
 The baseline comes from the public WinGet source. Candidate manifests are copied
 from the production packaging output; only their download URL and hash change.
-Local manifests exercise WinGet selection, the installer, and installed ARP state.
-They do not exercise publication or writing the source's tracking catalog.
+A temporary explicit trusted REST source exercises package selection, download,
+installer execution, source tracking and installed ARP state. Its metadata comes
+from the generated production manifests; it does not publish to the public index.
 #>
 [CmdletBinding()]
 param(
@@ -16,6 +17,7 @@ param(
     [string]$LegacyVersion,
     [string]$BuildScriptPath,
     [string]$ManagedUpdaterTestPath = (Join-Path $PSScriptRoot 'installer-updater.ps1'),
+    [string]$SourceServerScriptPath = (Join-Path $PSScriptRoot 'winget-test-source.py'),
     [string]$ReportDirectory
 )
 
@@ -46,7 +48,8 @@ $uninstallRoot = 'Software\Microsoft\Windows\CurrentVersion\Uninstall'
 $runRegistryPath = 'Software\Microsoft\Windows\CurrentVersion\Run'
 if (-not $LegacyVersion) { $LegacyVersion = $applicationInfo.Baseline }
 if (-not $BuildScriptPath) { $BuildScriptPath = Join-Path $PSScriptRoot ('../' + $applicationInfo.BuildScript) }
-foreach ($inputPath in @($InstallerPath, $ExecutablePath, $ManifestDirectory, $BuildScriptPath, $ManagedUpdaterTestPath)) {
+foreach ($inputPath in @($InstallerPath, $ExecutablePath, $ManifestDirectory, $BuildScriptPath, $ManagedUpdaterTestPath,
+    $SourceServerScriptPath, (Join-Path $PSScriptRoot 'winget-trusted-source.ps1'))) {
     if (-not (Test-Path -LiteralPath $inputPath)) { throw "Required input does not exist: $inputPath" }
 }
 $InstallerPath = (Resolve-Path -LiteralPath $InstallerPath).Path
@@ -54,6 +57,8 @@ $ExecutablePath = (Resolve-Path -LiteralPath $ExecutablePath).Path
 $ManifestDirectory = (Resolve-Path -LiteralPath $ManifestDirectory).Path
 $BuildScriptPath = (Resolve-Path -LiteralPath $BuildScriptPath).Path
 $ManagedUpdaterTestPath = (Resolve-Path -LiteralPath $ManagedUpdaterTestPath).Path
+$SourceServerScriptPath = (Resolve-Path -LiteralPath $SourceServerScriptPath).Path
+. (Join-Path $PSScriptRoot 'winget-trusted-source.ps1')
 $version = [Version]$PackageVersion
 if ($PackageVersion -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or
     $version -le [Version]$LegacyVersion) {
@@ -96,6 +101,9 @@ $processPathSnapshot = $env:PATH
 $failure = $null
 $fixtureToken = [IntPtr]::Zero
 $tokenTest = $null
+$trustedSource = $null
+$trustedSourceEvidence = [Collections.Generic.List[object]]::new()
+$activeDiagnosticManifest = $null
 
 Add-Type -TypeDefinition @'
 using System;
@@ -457,6 +465,13 @@ function Read-Arp([string]$Code) {
         return $result
     } finally { if ($null -ne $key) { $key.Dispose() }; $base.Dispose() }
 }
+function Read-SharedTextFile([string]$Path) {
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+        ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    $reader = [IO.StreamReader]::new($stream)
+    try { return $reader.ReadToEnd() }
+    finally { $reader.Dispose() }
+}
 function Read-InstallerSignature([string]$Path) {
     # Certificate verification can consult providers. Bound this read-only probe
     # in its own process so diagnostics cannot delay cleanup indefinitely.
@@ -516,7 +531,7 @@ function Get-StagedInstallerEvidence([string]$ManifestPath, [DateTime]$StartedUt
         foreach ($file in @(Get-ChildItem -LiteralPath $wingetLogDirectory -Filter '*.log' -File |
             Where-Object { $_.LastWriteTimeUtc -ge $StartedUtc -and $_.Length -le 4MB } |
             Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 8)) {
-            foreach ($match in [regex]::Matches([IO.File]::ReadAllText($file.FullName), "Starting: '([^']+)' with arguments")) {
+            foreach ($match in [regex]::Matches((Read-SharedTextFile $file.FullName), "Starting: '([^']+)' with arguments")) {
                 $path = $match.Groups[1].Value
                 if ([IO.Path]::GetFileName($path) -ceq $filename -and
                     [IO.Path]::GetFileName([IO.Path]::GetDirectoryName($path)) -ceq $directoryName) { $null = $paths.Add($path) }
@@ -624,7 +639,7 @@ function Save-OwnedProcessDiagnostics([Diagnostics.Process]$RootProcess, [string
     }
     $diagnostic | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Destination -Encoding utf8
 }
-function Invoke-Logged([string]$File, [string[]]$Arguments, [string]$Label, [int]$TimeoutSeconds = 180) {
+function Invoke-Logged([string]$File, [string[]]$Arguments, [string]$Label, [int]$TimeoutSeconds = 180, [switch]$CaptureDiagnostics) {
     $info = [Diagnostics.ProcessStartInfo]::new($File)
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true
@@ -650,10 +665,12 @@ function Invoke-Logged([string]$File, [string[]]$Arguments, [string]$Label, [int
         try {
             if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
                 $timedOut = $true
-                if ($winget -and [string]::Equals($File, $winget, [StringComparison]::OrdinalIgnoreCase)) {
+                if ($CaptureDiagnostics -or ($winget -and [string]::Equals($File, $winget, [StringComparison]::OrdinalIgnoreCase))) {
                     $diagnosticsPath = "$prefix-timeout.json"
                     $manifestIndex = [Array]::IndexOf($Arguments, '--manifest')
-                    $diagnosticManifest = if ($manifestIndex -ge 0 -and $manifestIndex + 1 -lt $Arguments.Length) { $Arguments[$manifestIndex + 1] } else { $null }
+                    $diagnosticManifest = if ($manifestIndex -ge 0 -and $manifestIndex + 1 -lt $Arguments.Length) {
+                        $Arguments[$manifestIndex + 1]
+                    } else { $activeDiagnosticManifest }
                     try { Save-OwnedProcessDiagnostics $process $diagnosticsPath $diagnosticManifest }
                     catch { $captureError = 'Timeout diagnostics failed: ' + $_.Exception.ToString() }
                 }
@@ -815,7 +832,47 @@ function Prepare-Manifest([string]$Source, [string]$Setup, [string]$Version, [st
         [IO.File]::WriteAllText((Join-Path $destination $file.Name), $content)
     }
     $null = Invoke-WinGet @('validate', '--manifest', $destination, '--disable-interactivity') "validate-$Stage"
+    if ($null -ne $trustedSource) { Add-TestSourceVersion $trustedSource $destination $Version }
     return $destination
+}
+function Read-FixtureManifest([string]$Manifest) {
+    $files = @(Get-ChildItem -LiteralPath $Manifest -Filter '*.installer.yaml' -File)
+    if ($files.Count -ne 1) { throw 'Expected one generated installer manifest.' }
+    $yaml = [IO.File]::ReadAllText($files[0].FullName)
+    $result = @{}
+    foreach ($name in @('PackageIdentifier', 'PackageVersion', 'InstallerUrl', 'InstallerSha256')) {
+        $matches = [regex]::Matches($yaml, '(?m)^\s*' + $name + ':\s*([^\r\n]+)\s*$')
+        if ($matches.Count -ne 1) { throw "Expected one $name in the generated installer manifest." }
+        $result[$name] = $matches[0].Groups[1].Value.Trim().Trim([char[]]@('"', "'"))
+    }
+    if ($result.PackageIdentifier -cne $packageId -or $result.PackageVersion -notmatch '^\d+\.\d+\.\d+$' -or
+        $result.InstallerSha256 -notmatch '^[a-fA-F0-9]{64}$') { throw 'The fixture manifest identity/hash is invalid.' }
+    return $result
+}
+function Assert-TrustedInstallTrace([string]$Manifest, [string]$StageLogs, [string]$Stage) {
+    $fixture = Read-FixtureManifest $Manifest
+    $sourceMarker = 'Named source requested, found: ' + $trustedSource.Name
+    $traces = @(Get-ChildItem -LiteralPath $StageLogs -Filter '*.log' -File | ForEach-Object {
+        $text = Read-SharedTextFile $_.FullName
+        if ($text.Contains($sourceMarker)) { @{ Path = $_.FullName; Text = $text } }
+    })
+    if ($traces.Count -ne 1) { throw "$Stage did not yield one trace selecting the exact trusted fixture source." }
+    $trace = $traces[0].Text
+    $selectedIndex = $trace.IndexOf('Selected installer URL: ' + $fixture.InstallerUrl, [StringComparison]::Ordinal)
+    $hashIndex = $trace.IndexOf('Installer hash verified', [StringComparison]::Ordinal)
+    $zone = [regex]::Match($trace, 'Started applying motw to ([^\r\n]+) with zone: 2(?:\r?\n|$)')
+    $startIndex = $trace.IndexOf('Starting: ', [StringComparison]::Ordinal)
+    $expectedFilename = [IO.Path]::GetFileNameWithoutExtension(([uri]$fixture.InstallerUrl).AbsolutePath) + '.exe'
+    if ($selectedIndex -lt 0 -or $hashIndex -lt $selectedIndex -or -not $zone.Success -or
+        $zone.Index -lt $hashIndex -or $startIndex -lt $zone.Index -or
+        [IO.Path]::GetFileName($zone.Groups[1].Value.Trim('"')) -cne $expectedFilename -or
+        [IO.Path]::GetFileName([IO.Path]::GetDirectoryName($zone.Groups[1].Value.Trim('"'))) -cne ($packageId + '.' + $fixture.PackageVersion) -or
+        $trace -notmatch [regex]::Escape($fixture.InstallerSha256.ToLowerInvariant())) {
+        throw "$Stage did not prove source selection, expected installer SHA verification, and Zone 2 before launch."
+    }
+    $trustedSourceEvidence.Add(@{ Stage = $Stage; Name = $trustedSource.Name; Identifier = $trustedSource.Identifier;
+        Version = $fixture.PackageVersion; InstallerUrl = $fixture.InstallerUrl; InstallerSha256 = $fixture.InstallerSha256;
+        Registration = $trustedSource.Registration; HashVerifiedBeforeTrustedZone = $true; Trace = $traces[0].Path })
 }
 function Build-Fixture([int]$Offset) {
     $fixtureVersion = '{0}.{1}.{2}' -f $version.Major, $version.Minor, ($version.Build + $Offset)
@@ -830,19 +887,22 @@ function Build-Fixture([int]$Offset) {
     return @{ Version = $fixtureVersion; Setup = $setup; Manifests = (Join-Path $output 'winget') }
 }
 function Upgrade-Package([string]$Manifest, [string]$Stage, [switch]$AllowFailure) {
-    # WinGet 1.29.380 rejects --log with upgrade --manifest: --log belongs
-    # to SingleInstallerBehavior, which UpgradeCommand requires a query for.
-    # Its Inno handler still adds /LOG automatically. Capture that default log
-    # without changing the production manifest or weakening the upgrade path.
+    # Use the same trusted-source path as published packages. WinGet itself
+    # verifies the installer hash and assigns Zone 2 before ShellExecute.
+    $fixture = Read-FixtureManifest $Manifest
+    $null = Assert-TestSourceRegistration $trustedSource ("source-before-$Stage")
     $priorLogs = @{}
     foreach ($file in @(Get-ChildItem -LiteralPath $wingetLogDirectory -Filter '*.log' -File)) {
         $priorLogs[$file.FullName] = "$($file.Length):$($file.LastWriteTimeUtc.Ticks)"
     }
+    $script:activeDiagnosticManifest = $Manifest
     try {
-        $result = Invoke-WinGet @('upgrade', '--manifest', $Manifest, '--silent',
+        $result = Invoke-WinGet @('upgrade', '--source', $trustedSource.Name, '--id', $packageId, '--exact',
+            '--version', $fixture.PackageVersion, '--scope', 'user', '--silent',
             '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity',
             '--verbose-logs') $Stage -AllowFailure
     } finally {
+        $script:activeDiagnosticManifest = $null
         # Invoke-Logged may throw on timeout. Still retain the client's trace
         # and any partial Inno log after the owned process tree has been stopped.
         $stageLogs = Join-Path $logDirectory "$Stage-winget"
@@ -864,6 +924,7 @@ function Upgrade-Package([string]$Manifest, [string]$Stage, [switch]$AllowFailur
         }
         Write-Host "Captured default WinGet logs for ${Stage}: $stageLogs"
     }
+    Assert-TrustedInstallTrace $Manifest $stageLogs $Stage
     if ($result.ExitCode -ne 0 -and -not $AllowFailure) { throw "$Stage failed: $($result.Text)" }
     return $result
 }
@@ -948,11 +1009,6 @@ try {
         throw "The pinned client's default log directory was not found: $wingetLogDirectory"
     }
     $settingsSnapshot = $settings.Text | ConvertFrom-Json -AsHashtable
-    if (-not $settingsSnapshot.adminSettings.ContainsKey('LocalManifestFiles')) { throw 'WinGet did not export the LocalManifestFiles setting.' }
-    if (-not $settingsSnapshot.adminSettings.LocalManifestFiles) {
-        $changedLocalManifestSetting = $true
-        $null = Invoke-WinGet @('settings', '--enable', 'LocalManifestFiles', '--disable-interactivity') 'enable-local-manifests'
-    }
 
     # The listener binds to loopback and serves only the generated setup filenames.
     $reservation = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
@@ -1102,6 +1158,10 @@ try {
     }
     Write-Host "Loopback download server ready: $script:serverUrl ($lastProbe)"
     $initialManifest = Prepare-Manifest $ManifestDirectory $InstallerPath $PackageVersion 'migration'
+    $trustedSource = New-TestSourceState ([IO.Path]::GetTempPath()) $Application
+    Add-TestSourceVersion $trustedSource $initialManifest $PackageVersion
+    $python = (Get-Command python.exe -CommandType Application -ErrorAction Stop).Source
+    Start-TestSource $trustedSource $SourceServerScriptPath $python
 
     $installedByTest = $true
     $null = Invoke-WinGet @('install', '--id', $packageId, '--exact', '--version', $LegacyVersion,
@@ -1208,9 +1268,28 @@ try {
     # Reuse the last compiled fixture to cover the target-absent installer path.
     $installDirectory = Join-Path $work 'Fresh installation with spaces'
     $installedExe = Join-Path $installDirectory "$Application.exe"
-    $null = Invoke-WinGet @('install', '--manifest', $manifest, '--scope', 'user', '--location', $installDirectory,
-        '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity',
-        '--log', (Join-Path $logDirectory 'fresh-installer.log')) 'fresh-silent-install'
+    $null = Assert-TestSourceRegistration $trustedSource 'source-before-fresh-install'
+    $priorLogs = @{}
+    foreach ($file in @(Get-ChildItem -LiteralPath $wingetLogDirectory -Filter '*.log' -File)) {
+        $priorLogs[$file.FullName] = "$($file.Length):$($file.LastWriteTimeUtc.Ticks)"
+    }
+    $script:activeDiagnosticManifest = $manifest
+    try {
+        $null = Invoke-WinGet @('install', '--source', $trustedSource.Name, '--id', $packageId, '--exact', '--version', $next.Version,
+            '--scope', 'user', '--location', $installDirectory, '--silent', '--accept-package-agreements',
+            '--accept-source-agreements', '--disable-interactivity', '--verbose-logs',
+            '--log', (Join-Path $logDirectory 'fresh-installer.log')) 'fresh-silent-install'
+    } finally {
+        $script:activeDiagnosticManifest = $null
+        $freshLogs = Join-Path $logDirectory 'fresh-silent-install-winget'
+        $null = New-Item -ItemType Directory -Path $freshLogs
+        foreach ($file in @(Get-ChildItem -LiteralPath $wingetLogDirectory -Filter '*.log' -File)) {
+            $stamp = "$($file.Length):$($file.LastWriteTimeUtc.Ticks)"
+            if ($priorLogs.ContainsKey($file.FullName) -and $priorLogs[$file.FullName] -ceq $stamp) { continue }
+            Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $freshLogs $file.Name)
+        }
+    }
+    Assert-TrustedInstallTrace $manifest $freshLogs 'fresh-silent-install'
     Assert-Stopped
     Assert-Installed $next.Version $false
     $fresh = Start-Installed
@@ -1247,6 +1326,8 @@ try {
             } catch { $cleanupErrors.Add("Owned installation cleanup: $_") }
         }
     }
+    try { Stop-TestSource $trustedSource }
+    catch { $cleanupErrors.Add("Trusted source cleanup: $_") }
     if ($serverJob) { Stop-Job $serverJob -ErrorAction SilentlyContinue; Remove-Job $serverJob -Force -ErrorAction SilentlyContinue }
     if ($sentinel -and (Test-Path -LiteralPath $sentinel)) { Remove-Item -LiteralPath $sentinel -Force }
     if ($changedLocalManifestSetting -and $winget) {
@@ -1277,8 +1358,13 @@ try {
             CandidateHash = $expectedHash; Checks = $checks.ToArray(); Commands = $commands.ToArray();
             TokenComparisons = $tokenComparisons.ToArray();
             TokenTest = $tokenTest;
+            TrustedSourceEvidence = $trustedSourceEvidence.ToArray();
+            SourceFixture = $(if ($null -ne $trustedSource) { @{ Name = $trustedSource.Name; Identifier = $trustedSource.Identifier;
+                Url = $trustedSource.Url; Registration = $trustedSource.Registration;
+                CertificateStore = 'LocalMachine/Root';
+                CertificateThumbprint = $(if ($trustedSource.Certificate) { $trustedSource.Certificate.Thumbprint }) } });
             Failure = $(if ($failure) { $failure.ToString() } else { $null }); CleanupErrors = $cleanupErrors.ToArray();
-            Limitation = 'Local candidate manifests do not publish or write the source tracking catalog.' }
+            Limitation = 'Candidates use an isolated explicit trusted REST source built from production manifests; public winget publication/index propagation is not exercised.' }
         $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $work 'result.json') -Encoding utf8
         Write-Host "Package-manager acceptance report: $work"
     }

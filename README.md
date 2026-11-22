@@ -180,7 +180,8 @@ installer:
 - the actual tray menu disables and re-enables autostart, and the choice
   survives subsequent launches;
 - the real WinGet client installs the published `0.1.9` portable package, then
-  upgrades the running application using a generated installer manifest;
+  upgrades the running application through a temporary HTTPS WinGet REST source
+  containing the generated candidate manifests;
 - subsequent installer upgrades preserve running/stopped state, the autostart
   choice, the installed path, and user settings;
 - installed payload hashes, process replacement, tray readiness, and the
@@ -190,9 +191,29 @@ installer:
   fixture for GitHub transport, including rejection of a mismatching SHA-256.
 
 Installer tests use explicitly synthetic package versions such as `999.0.1` to
-exercise multiple upgrades before a public release exists. They run only on
-disposable GitHub-hosted Windows runners. They do not replace a real sign-in
-test or hardware-dependent DDC/CI, HDR, and suspend/resume checks.
+exercise multiple upgrades before a public release exists. They run only in an
+elevated session on disposable GitHub-hosted Windows runners. They do not
+replace a real sign-in test or hardware-dependent DDC/CI, HDR, and suspend/resume
+checks.
+
+The candidate source is registered as a trusted test source on that disposable
+VM. It serves the production-generated package metadata and installer hashes;
+the initial portable package still comes from the public `winget` source. The
+harness temporarily adds its generated test CA to that VM's machine root
+certificate store. It removes that exact certificate, the temporary source,
+and the server when it finishes; private TLS material stays outside uploaded
+diagnostics. This exercises source-backed package selection and installation;
+it does not publish the candidate to the public WinGet catalog.
+
+Both Windows acceptance jobs install the source fixture's pinned dependency,
+`PyYAML==6.0.3`, and run its focused tests before invoking the WinGet harness.
+The fixture tests can also be run with Python 3.10 or newer and OpenSSL on PATH
+for the TLS cases; CI requires those cases to run:
+
+```powershell
+python -m pip install -r scripts/e2e/winget-test-source-requirements.txt
+python -m unittest discover -s scripts/e2e -p test_winget_test_source.py -v
+```
 
 ### Packaging and WinGet publication
 

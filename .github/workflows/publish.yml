@@ -99,6 +99,22 @@ jobs:
         shell: powershell
         run: ./scripts/e2e/autostart.ps1
 
+      - name: Install WinGet source fixture dependencies
+        id: winget_source_dependencies
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
+        shell: pwsh
+        run: python -m pip install --disable-pip-version-check -r scripts/e2e/winget-test-source-requirements.txt
+
+      - name: Test the WinGet source fixture
+        id: winget_source_tests
+        if: ${{ !cancelled() && steps.winget_source_dependencies.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) {
+            throw 'OpenSSL is required; the TLS fixture tests must not be skipped in CI.'
+          }
+          python -m unittest discover -s scripts/e2e -p test_winget_test_source.py -v
+
       - name: Package the installer test fixture
         id: installer_fixture
         if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
@@ -106,7 +122,7 @@ jobs:
         run: ./scripts/package-windows.ps1 -Version 999.0.1 -OutputDirectory target/package-e2e
 
       - name: Verify real WinGet upgrades before publication
-        if: ${{ !cancelled() && steps.installer_fixture.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.installer_fixture.outcome == 'success' && steps.winget_source_tests.outcome == 'success' }}
         shell: pwsh
         run: >-
           ./scripts/e2e/winget-upgrade.ps1
