@@ -37,15 +37,17 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Validate updater PowerShell syntax
+      - name: Validate PowerShell syntax
         shell: pwsh
         run: |
-          $tokens = $null
-          $errors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile(
-            (Resolve-Path scripts/windows-updater.ps1), [ref]$tokens, [ref]$errors
-          ) | Out-Null
-          if ($errors) { throw ($errors | Out-String) }
+          Get-ChildItem scripts -Recurse -Filter '*.ps1' | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName, [ref]$tokens, [ref]$errors
+            ) | Out-Null
+            if ($errors) { throw ($errors | Out-String) }
+          }
 
       - name: Run Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
@@ -68,7 +70,7 @@ jobs:
   updater-live:
     name: Live updater E2E
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - name: Checkout source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -81,22 +83,78 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Build both production binaries
+        id: release_build
         run: cargo build --release --locked
       - name: Verify application identity
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
         shell: pwsh
         run: ./scripts/e2e/application-identity.ps1
       - name: Tray recovery and process replacement
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
         shell: pwsh
         run: ./scripts/e2e/tray-lifecycle.ps1 -RestartExplorer
+      - name: Autostart registration and tray preferences
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
+        shell: powershell
+        run: ./scripts/e2e/autostart.ps1
       - name: Update notification and log reader
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
         shell: pwsh
         run: ./scripts/e2e/update-log.ps1
       - name: Automatic update startup preferences
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
         shell: pwsh
         run: ./scripts/e2e/startup-updates.ps1
+      - name: Install WinGet source fixture dependencies
+        id: winget_source_dependencies
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
+        shell: pwsh
+        run: python -m pip install --disable-pip-version-check -r scripts/e2e/winget-test-source-requirements.txt
+      - name: Test the WinGet source fixture
+        id: winget_source_tests
+        if: ${{ !cancelled() && steps.winget_source_dependencies.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) {
+            throw 'OpenSSL is required; the TLS fixture tests must not be skipped in CI.'
+          }
+          python -m unittest discover -s scripts/e2e -p test_winget_test_source.py -v
+      - name: Package the installer test fixture
+        id: installer_fixture
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
+        shell: pwsh
+        run: ./scripts/package-windows.ps1 -Version 999.0.1 -OutputDirectory target/package-e2e
+      - name: Verify Inno script and native process controls
+        id: inno_probe
+        if: ${{ !cancelled() && steps.installer_fixture.outcome == 'success' }}
+        shell: pwsh
+        run: ./scripts/e2e/inno-array-probe.ps1 -ReportDirectory "$env:RUNNER_TEMP/winget-upgrade-brightwheel/inno-array-probe"
+      - name: Real WinGet upgrades and installer-managed updates
+        if: ${{ !cancelled() && steps.installer_fixture.outcome == 'success' && steps.winget_source_tests.outcome == 'success' && steps.inno_probe.outcome == 'success' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          ./scripts/e2e/winget-upgrade.ps1
+          -Application brightwheel
+          -InstallerPath target/package-e2e/brightwheel-setup.exe
+          -ExecutablePath target/release/brightwheel.exe
+          -LegacyVersion 0.1.9
+          -PackageVersion 999.0.1
+          -ManifestDirectory target/package-e2e/winget
+          -BuildScriptPath scripts/package-windows.ps1
       - name: Live upgrade and no-op behavior
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
         shell: pwsh
         run: ./scripts/e2e/updater-live.ps1 -Application brightwheel
+      - name: Preserve Windows package test diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: windows-package-e2e
+          path: ${{ runner.temp }}/winget-upgrade-brightwheel
+          if-no-files-found: ignore
+          retention-days: 7
 
   dependency-security:
     name: Dependency security

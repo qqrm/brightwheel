@@ -21,6 +21,7 @@ $parentProcess = $null
 $newProcess = $null
 $updateGate = $null
 $gateOwned = $false
+$preserveInstallerStaging = $false
 
 Add-Type -TypeDefinition @'
 using System;
@@ -139,6 +140,31 @@ function Wait-ReadyTray {
     throw 'Updated BrightWheel did not register a usable tray icon'
 }
 
+function Get-InstallerRegistration {
+    # An installed copy must be upgraded by its installer so WinGet's installed
+    # version and uninstall metadata stay in sync with the running executable.
+    # A separate portable/Cargo copy must not update another installation.
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+        [Microsoft.Win32.RegistryHive]::CurrentUser,
+        [Microsoft.Win32.RegistryView]::Registry64
+    )
+    try {
+        $key = $base.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Uninstall\QQRM.BrightWheel_is1')
+        if ($null -eq $key) { return $null }
+        try {
+            $location = [string]$key.GetValue('InstallLocation', '')
+            if (-not $location -or -not [IO.Path]::IsPathRooted($location)) { return $null }
+            $registered = [IO.Path]::GetFullPath((Join-Path $location 'brightwheel.exe'))
+            if (-not $registered.Equals([IO.Path]::GetFullPath($TargetPath), [StringComparison]::OrdinalIgnoreCase)) {
+                return $null
+            }
+            return [pscustomobject]@{
+                Version = [string]$key.GetValue('DisplayVersion', '')
+            }
+        } finally { $key.Dispose() }
+    } finally { $base.Dispose() }
+}
+
 try {
     if ([IO.Path]::GetFileName($TargetPath) -cne 'brightwheel.exe') {
         throw "Update target must be brightwheel.exe"
@@ -166,6 +192,47 @@ try {
     if ($latest -le $current) {
         Write-UpdateLog "Already up to date ($CurrentVersion)"
         exit 10
+    }
+
+    if ($null -ne (Get-InstallerRegistration)) {
+        $setupAsset = Verified-Asset $release $tag 'brightwheel-setup.exe'
+        $installedAsset = Verified-Asset $release $tag 'brightwheel.exe'
+        $setupPath = Join-Path $workDir 'brightwheel-setup.exe'
+        Invoke-WebRequest -Uri $setupAsset.Uri -Headers $headers -OutFile $setupPath -UseBasicParsing -TimeoutSec 180 | Out-Null
+        Assert-Verified $setupPath $setupAsset
+        if ($parentProcess.HasExited) {
+            Write-UpdateLog 'Update cancelled: the original BrightWheel instance was replaced'
+            exit 0
+        }
+        Write-UpdateLog "Verified installer for $tag; upgrading the managed installation"
+        # The installer owns shutdown, rollback, and conditional restart. Do not
+        # stop the application or fall back to a raw copy on installer failure.
+        $setupLog = "$LogPath.installer.log"
+        $arguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-',
+            ('/DIR="' + $directory + '"'), ('/LOG="' + $setupLog + '"'))
+        $setup = $null
+        try {
+            # Start-Process -Wait also waits for descendants, including the
+            # restarted tray. Hold and wait for only the installer process.
+            $setup = Start-Process -FilePath $setupPath -ArgumentList $arguments -PassThru -ErrorAction Stop
+            $preserveInstallerStaging = $true
+            $null = $setup.Handle
+            if (-not $setup.WaitForExit(180000)) {
+                throw "Installer did not complete within 180 seconds; setup may still be running (PID $($setup.Id))"
+            }
+            $preserveInstallerStaging = $false
+            if ($setup.ExitCode -ne 0) { throw "Installer failed with exit code $($setup.ExitCode)" }
+        } finally {
+            if ($null -ne $setup) { $setup.Dispose() }
+        }
+        Assert-Verified $TargetPath $installedAsset
+        $registration = Get-InstallerRegistration
+        if ($null -eq $registration -or $registration.Version -ne $latest.ToString()) {
+            throw 'Installer did not update the installed application version'
+        }
+        Wait-ReadyTray
+        Write-UpdateLog "Updated managed installation to $tag"
+        exit 0
     }
 
     # A Cargo installation contains both binaries. Only replace the optional CLI
@@ -283,5 +350,9 @@ try {
     foreach ($entry in $stagedEntries) {
         Remove-Item -LiteralPath $entry.Candidate -Force -ErrorAction SilentlyContinue
     }
-    Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
+    if ($preserveInstallerStaging) {
+        Write-UpdateLog "Installer may still be running; update staging retained at $workDir"
+    } else {
+        Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }

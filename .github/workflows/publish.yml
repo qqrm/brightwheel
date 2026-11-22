@@ -17,7 +17,7 @@ permissions:
 jobs:
   release:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     environment: release
     permissions:
       contents: write
@@ -86,11 +86,68 @@ jobs:
         run: cargo publish --dry-run --locked
 
       - name: Build release binaries
+        id: release_build
         run: cargo build --release --locked
 
       - name: Verify application identity
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
         shell: pwsh
         run: ./scripts/e2e/application-identity.ps1
+
+      - name: Verify real autostart registration and tray preferences
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
+        shell: powershell
+        run: ./scripts/e2e/autostart.ps1
+
+      - name: Install WinGet source fixture dependencies
+        id: winget_source_dependencies
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
+        shell: pwsh
+        run: python -m pip install --disable-pip-version-check -r scripts/e2e/winget-test-source-requirements.txt
+
+      - name: Test the WinGet source fixture
+        id: winget_source_tests
+        if: ${{ !cancelled() && steps.winget_source_dependencies.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) {
+            throw 'OpenSSL is required; the TLS fixture tests must not be skipped in CI.'
+          }
+          python -m unittest discover -s scripts/e2e -p test_winget_test_source.py -v
+
+      - name: Package the installer test fixture
+        id: installer_fixture
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
+        shell: pwsh
+        run: ./scripts/package-windows.ps1 -Version 999.0.1 -OutputDirectory target/package-e2e
+
+      - name: Verify Inno script and native process controls
+        id: inno_probe
+        if: ${{ !cancelled() && steps.installer_fixture.outcome == 'success' }}
+        shell: pwsh
+        run: ./scripts/e2e/inno-array-probe.ps1 -ReportDirectory "$env:RUNNER_TEMP/winget-upgrade-brightwheel/inno-array-probe"
+
+      - name: Verify real WinGet upgrades before publication
+        if: ${{ !cancelled() && steps.installer_fixture.outcome == 'success' && steps.winget_source_tests.outcome == 'success' && steps.inno_probe.outcome == 'success' }}
+        shell: pwsh
+        run: >-
+          ./scripts/e2e/winget-upgrade.ps1
+          -Application brightwheel
+          -InstallerPath target/package-e2e/brightwheel-setup.exe
+          -ExecutablePath target/release/brightwheel.exe
+          -LegacyVersion 0.1.9
+          -PackageVersion 999.0.1
+          -ManifestDirectory target/package-e2e/winget
+          -BuildScriptPath scripts/package-windows.ps1
+
+      - name: Preserve Windows package test diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: release-windows-package-e2e
+          path: ${{ runner.temp }}/winget-upgrade-brightwheel
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Package release assets
         id: assets
@@ -99,25 +156,9 @@ jobs:
           VERSION: ${{ steps.release.outputs.version }}
         run: |
           $version = $env:VERSION
-          $dist = Join-Path $PWD 'target\dist'
-          New-Item -ItemType Directory -Force -Path $dist | Out-Null
-
-          $tray = Join-Path $dist 'brightwheel.exe'
-          $cli = Join-Path $dist 'bright.exe'
-          Copy-Item 'target\release\brightwheel.exe' $tray -Force
-          Copy-Item 'target\release\bright.exe' $cli -Force
-
+          ./scripts/package-windows.ps1 -Version $version
+          $dist = (Resolve-Path 'target/dist').Path
           $zipName = "brightwheel-$version-x86_64-pc-windows-msvc.zip"
-          $zip = Join-Path $dist $zipName
-          Compress-Archive -Path $tray, $cli -DestinationPath $zip -Force
-
-          $checksumFiles = @($tray, $cli, $zip)
-          $checksums = foreach ($file in $checksumFiles) {
-            $hash = (Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant()
-            "$hash  $([IO.Path]::GetFileName($file))"
-          }
-          $checksums | Set-Content (Join-Path $dist 'SHA256SUMS.txt') -Encoding utf8NoBOM
-
           "dist=$dist" >> $env:GITHUB_OUTPUT
           "zip=$zipName" >> $env:GITHUB_OUTPUT
 
@@ -132,30 +173,49 @@ jobs:
           $tag = $env:TAG
           $version = $env:VERSION
           $dist = $env:DIST
+          $isPrerelease = $version.Contains('-')
           $assets = @(
             (Join-Path $dist 'brightwheel.exe'),
             (Join-Path $dist 'bright.exe'),
             (Join-Path $dist $env:ZIP),
             (Join-Path $dist 'SHA256SUMS.txt')
           )
+          if (-not $isPrerelease) {
+            $assets += @(
+              (Join-Path $dist 'brightwheel-setup.exe'),
+              (Join-Path $dist 'brightwheel-winget-manifests.zip')
+            )
+          }
+          $installationNotes = if ($isPrerelease) {
+            'This prerelease contains portable executables only. Download `brightwheel.exe` to run the tray app; `bright.exe` is the optional command-line companion. The ZIP contains both executables.'
+          } else {
+            @'
+          Use `brightwheel-setup.exe` for a per-user installation with automatic shutdown and restart when upgrading a running copy. Existing WinGet portable installations are migrated in place, preserving their autostart choice and command alias. A stopped application stays stopped during a silent upgrade.
+
+          `brightwheel.exe` remains the standalone tray app. `bright.exe` is the optional command-line companion. The ZIP contains both portable executables.
+
+          `brightwheel-winget-manifests.zip` contains the generated manifests for the installer. UniGetUI/WinGet will use the new package after its manifest is accepted in microsoft/winget-pkgs.
+          '@
+          }
           $notes = Join-Path $dist 'RELEASE_NOTES.md'
           @"
           BrightWheel $version
 
           Windows tray application for DDC/CI monitor brightness and HDR control.
 
-          Download ``brightwheel.exe`` to run the tray app. ``bright.exe`` is the optional command-line companion. The ZIP contains both executables.
+          $installationNotes
 
           Requirements: 64-bit Windows 10/11 and an external monitor with DDC/CI enabled. The executables are unsigned, so Windows SmartScreen may show a warning on first launch.
           "@ | Set-Content $notes -Encoding utf8NoBOM
 
           & gh release view $tag *> $null
+          $releaseKind = if ($isPrerelease) { '--prerelease' } else { '--prerelease=false' }
           if ($LASTEXITCODE -eq 0) {
-            & gh release edit $tag --title "BrightWheel $version" --notes-file $notes
+            & gh release edit $tag --title "BrightWheel $version" --notes-file $notes $releaseKind
             if ($LASTEXITCODE -ne 0) { throw 'Failed to update the GitHub Release.' }
             & gh release upload $tag @assets --clobber
           } else {
-            & gh release create $tag @assets --verify-tag --title "BrightWheel $version" --notes-file $notes
+            & gh release create $tag @assets --verify-tag --title "BrightWheel $version" --notes-file $notes $releaseKind
           }
           if ($LASTEXITCODE -ne 0) { throw 'Failed to upload GitHub Release assets.' }
 

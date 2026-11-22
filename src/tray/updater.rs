@@ -322,7 +322,10 @@ fn spawn_updater() -> io::Result<Child> {
         return Err(error);
     }
 
+    // The app may inherit PowerShell 7 module paths. Let Windows PowerShell
+    // construct its own paths so its Utility module can load correctly.
     let child = Command::new(powershell)
+        .env_remove("PSModulePath")
         .arg("-NoLogo")
         .arg("-NoProfile")
         .arg("-NonInteractive")
