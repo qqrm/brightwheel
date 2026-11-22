@@ -58,13 +58,14 @@ public static class UpdateLogNative {
         Rect rect;
         return Shell_NotifyIconGetRect(ref id, out rect) == 0;
     }
-    public static string AssociatedExecutable() {
+    public static string Association(uint kind) {
         uint size = 32768;
         var output = new StringBuilder((int)size);
-        int result = AssocQueryString(0, 2, ".log", null, output, ref size);
-        if (result != 0) Marshal.ThrowExceptionForHR(result);
-        return output.ToString();
+        int result = AssocQueryString(0, kind, ".log", null, output, ref size);
+        return result == 0 ? output.ToString() : "<HRESULT 0x" + result.ToString("X8") + ">";
     }
+    public static string AssociatedExecutable() { return Association(2); }
+    public static string AssociatedProgId() { return Association(20); }
     public static string DialogText(IntPtr dialog) {
         var output = new StringBuilder();
         for (IntPtr child = GetWindow(dialog, 5); child != IntPtr.Zero; child = GetWindow(child, 2)) {
@@ -209,15 +210,26 @@ try {
         $oldDefault = $extension.GetValue('', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
         $oldKind = $extension.GetValueKind('')
     }
+    $originalExtension = if ($hadDefault) { "$oldDefault ($oldKind)" } else { '<absent>' }
+    # Observe only the ProgId, not the protected hash; UserChoice is never changed.
+    $userChoice = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.log\UserChoice')
+    try { $userChoiceProgId = if ($null -ne $userChoice) { $userChoice.GetValue('ProgId', '<absent>') } else { '<absent>' } }
+    finally { if ($null -ne $userChoice) { $userChoice.Dispose() } }
+    Write-Host "Fixture association before setup: reader='$([UpdateLogNative]::AssociatedExecutable())'; resolved ProgId='$([UpdateLogNative]::AssociatedProgId())'; HKCU default='$originalExtension'; UserChoice ProgId='$userChoiceProgId'"
     $command = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("$progIdPath\shell\open\command")
     try { $command.SetValue('', ('"{0}" "%1"' -f $reader), [Microsoft.Win32.RegistryValueKind]::String) }
     finally { $command.Dispose() }
     $associationChanged = $true
     $extension.SetValue('', $progId, [Microsoft.Win32.RegistryValueKind]::String)
-    [UpdateLogNative]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)
-    if ([UpdateLogNative]::AssociatedExecutable() -ine $reader) {
-        throw 'The test .log association is not effective (possibly a UserChoice override)'
+    # SHCNF_IDLIST | SHCNF_FLUSH waits for change delivery; do not race shell
+    # cache invalidation immediately after registering the disposable reader.
+    [UpdateLogNative]::SHChangeNotify(0x08000000, 0x1000, [IntPtr]::Zero, [IntPtr]::Zero)
+    try {
+        Wait-For { [UpdateLogNative]::AssociatedExecutable() -ieq $reader } 'the exact effective .log reader'
+    } catch {
+        throw "The test .log association did not become effective: expected='$reader'; actual='$([UpdateLogNative]::AssociatedExecutable())'; resolved ProgId='$([UpdateLogNative]::AssociatedProgId())'; saved HKCU default='$originalExtension'; UserChoice ProgId='$userChoiceProgId'. $($_.Exception.Message)"
     }
+    Write-Host "Fixture association ready: reader='$([UpdateLogNative]::AssociatedExecutable())'; resolved ProgId='$([UpdateLogNative]::AssociatedProgId())'"
 
     $config = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($configPath, $true)
     $configExisted = $null -ne $config
@@ -321,7 +333,7 @@ try {
         if ($removeExtension) { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($extensionPath, $false) }
     }
     [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($progIdPath, $false)
-    [UpdateLogNative]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)
+    [UpdateLogNative]::SHChangeNotify(0x08000000, 0x1000, [IntPtr]::Zero, [IntPtr]::Zero)
     if (Test-Path -LiteralPath $runtimeLog) { Get-Content -LiteralPath $runtimeLog -Tail 12 | ForEach-Object { Write-Host $_.Substring(0, [Math]::Min($_.Length, 250)) } }
     if (Test-Path -LiteralPath $install) { Remove-Item -LiteralPath $install -Recurse -Force }
 }
