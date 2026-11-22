@@ -154,11 +154,16 @@ replacement. These notification tests do not claim a physical suspend/resume
 test; that still needs a Windows machine and its actual display driver.
 
 On the disposable Windows CI runner, `scripts/e2e/update-log.ps1` checks the
-production failure-to-notification path, posted version-4 shell callbacks and
-actual tray menu selection. A temporary
-`.log` association launches a real reader and verifies the exact path and log
-contents. The test restores the original association and settings afterwards;
-it does not simulate a physical click on a Windows notification banner.
+production failure-to-notification path in two phases. A controlled updater child
+verifies bounded stderr capture and replacement of a failure action with an
+informational notification. A fresh production process with the normal Windows
+environment then runs the real PowerShell updater, whose safe basename check
+produces a failure before any network request or executable replacement. Posted
+version-4 callbacks and actual mouse selection of verified tray menu items open
+the exact log path and contents in a real associated reader. The test also checks
+system Notepad when association resolution explicitly reports no handler, and
+restores the original association and settings afterwards. Notification banner
+clicks are represented by native callbacks rather than physical banner input.
 
 ## License
 

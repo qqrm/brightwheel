@@ -1,5 +1,7 @@
-# Production-process callback/menu E2E with a real associated reader EXE. Restore
-# the disposable .log association in finally; never modify Windows UserChoice.
+# A controlled child verifies stderr/notification state first. A fresh owner with
+# normal Windows environment then exercises the real updater's basename failure
+# through the callback/menu and associated reader. Restore registry state in
+# finally; never modify Windows UserChoice.
 # Posted native shell callbacks are tested, not physical clicks on toast banners.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -174,6 +176,7 @@ $unique = [guid]::NewGuid().ToString('N')
 # Spaces, Unicode and shell metacharacters must remain one literal document arg.
 $install = Join-Path $temporaryRoot "update log & [Unicode-$([char]0x03bb)]-$unique"
 $target = Join-Path $install 'brightwheel.exe'
+$failureTarget = Join-Path $install 'brightwheel-failure-fixture.exe'
 $reader = Join-Path $install 'log-reader.exe'
 $capture = Join-Path $install 'opened-paths.txt'
 $fakeSystemRoot = Join-Path $install 'fixture-windows'
@@ -254,6 +257,24 @@ function Send-TrayEvent([uint32]$event, [uint32]$iconId = 1) {
     if (-not [UpdateLogNative]::PostMessage($script:window, 0x8001, [UIntPtr]::Zero, $packed)) {
         throw 'Could not post the native tray callback'
     }
+}
+
+function Start-OwnedApp([string]$executable, [switch]$fakeUpdater) {
+    # The controlled child phase overrides SystemRoot only in its owner. Shell
+    # activation runs in a fresh process with the real Windows environment.
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $executable
+    $startInfo.Arguments = '--skip-startup-update'
+    $startInfo.UseShellExecute = $false
+    $startInfo.EnvironmentVariables['LOCALAPPDATA'] = $data
+    if ($fakeUpdater) { $startInfo.EnvironmentVariables['SystemRoot'] = $fakeSystemRoot }
+    $script:process = [Diagnostics.Process]::Start($startInfo)
+    Wait-For {
+        $script:window = [UpdateLogNative]::FindWindow('BrightWheel.HiddenWindow', 'BrightWheel')
+        [uint32]$ownerPid = 0
+        $null = [UpdateLogNative]::GetWindowThreadProcessId($script:window, [ref]$ownerPid)
+        $ownerPid -eq $process.Id -and [UpdateLogNative]::HasIcon($script:window)
+    } 'the production tray icon'
 }
 
 function Invoke-TrayMenu([uint32]$commandId, [string]$label) {
@@ -399,48 +420,59 @@ try {
     }
     $config.SetValue('AutoStartConfigured', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
     $config.SetValue('AutoUpdateEnabled', 0, [Microsoft.Win32.RegistryValueKind]::DWord)
-    # Override only the application's environment. The test host must keep its
-    # real SystemRoot so Windows can load the modules used to launch processes.
-    $startInfo = [Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $target
-    $startInfo.Arguments = '--skip-startup-update'
-    $startInfo.UseShellExecute = $false
-    $startInfo.EnvironmentVariables['LOCALAPPDATA'] = $data
-    $startInfo.EnvironmentVariables['SystemRoot'] = $fakeSystemRoot
-    $process = [Diagnostics.Process]::Start($startInfo)
-    Wait-For {
-        $script:window = [UpdateLogNative]::FindWindow('BrightWheel.HiddenWindow', 'BrightWheel')
-        [uint32]$ownerPid = 0
-        $null = [UpdateLogNative]::GetWindowThreadProcessId($script:window, [ref]$ownerPid)
-        $ownerPid -eq $process.Id -and [UpdateLogNative]::HasIcon($script:window)
-    } 'the production tray icon'
-
-    Send-TrayEvent 0x0405 # NIN_BALLOONUSERCLICK, no action yet
-    Assert-NoExtraOpen 0
+    Start-OwnedApp $target -fakeUpdater
     Run-ManualCheck 23
     $logged = Read-Text $logPath
     if (-not $logged.Contains('E2E updater stderr sentinel') -or $logged.Contains('END-SHOULD-NOT-BE-CAPTURED') -or $logged.Length -gt 17000) {
         throw 'Early helper stderr was missing, unbounded, or not captured'
     }
+    Write-Host 'PASS: a real controlled child exit is monitored, stderr is drained with bounded capture, and a failure notification is submitted'
+
+    [IO.File]::WriteAllText($helperResult, '10')
+    Run-ManualCheck 10
+    # A stale action must fail File::open before it could reach the deliberately
+    # isolated shell environment. Reject both reader launches and opener errors.
+    Remove-Item -LiteralPath $logPath
+    Send-TrayEvent 0x0405
+    Assert-NoExtraOpen 0
+    if ([UpdateLogNative]::FindWindow('#32770', 'BrightWheel error') -ne [IntPtr]::Zero -or
+        (Read-Text $runtimeLog).Contains('Could not open the update log')) {
+        throw 'The informational notification retained an update-log action'
+    }
+    Write-Host 'PASS: a monitored informational result clears the failure action; its click neither opens a reader nor attempts to open a missing log'
+
+    Remove-Item -LiteralPath $helper
+    Run-ManualCheck 1
+    if (-not (Read-Text $logPath).Contains('Update check failed:')) { throw 'Helper creation failure was not recorded' }
+    Write-Host 'PASS: helper process creation failure is logged and submits the same actionable failure notification'
+
+    if (-not [UpdateLogNative]::PostMessage($script:window, 0x0010, [UIntPtr]::Zero, [IntPtr]::Zero) -or
+        -not $process.WaitForExit(5000)) { throw 'The controlled-helper owner did not exit before the real-helper phase' }
+    $process.Dispose()
+    $process = $null
+    Remove-Item -LiteralPath $logPath
+    Copy-Item -LiteralPath $target -Destination $failureTarget
+    # The real embedded PowerShell updater rejects this owned basename before
+    # network access, shutdown, or replacement. Keep SystemRoot and TEMP real so
+    # the same owner can activate the configured document reader normally.
+    Start-OwnedApp $failureTarget
+    Send-TrayEvent 0x0405 # NIN_BALLOONUSERCLICK, no action in this owner yet
+    Assert-NoExtraOpen 0
+    Run-ManualCheck 1
+    $realFailure = 'Update failed: Update target must be brightwheel.exe'
+    if (-not (Read-Text $logPath).Contains($realFailure)) { throw 'The real PowerShell updater did not record its expected safe failure' }
     Send-TrayEvent 0x0405 2 # wrong icon ID must not consume the action
     Assert-NoExtraOpen 0
     Send-TrayEvent 0x0404 # timeout/hide can leave a clickable notification in history
     Send-TrayEvent 0x0403
     Send-TrayEvent 0x0405
-    Assert-Opened 1 'E2E updater stderr sentinel'
+    Assert-Opened 1 $realFailure
     Send-TrayEvent 0x0405
     Assert-NoExtraOpen 1
-    Write-Host 'PASS: early updater failure is logged; v4 failure click opens the exact log in the associated reader, even after banner timeout'
-
-    Run-ManualCheck 23 # arm a fresh failure, then replace it with information
-    [IO.File]::WriteAllText($helperResult, '10')
-    Run-ManualCheck 10
-    Send-TrayEvent 0x0405
-    Assert-NoExtraOpen 1
-    Write-Host 'PASS: informational notification clears the failure action; invalid/repeated clicks do not open an old log'
+    Write-Host 'PASS: actual PowerShell updater failure reaches the v4 callback and configured reader in the same owner, including banner timeout and invalid/repeated click checks'
 
     Invoke-TrayMenu 1005 'Open update log'
-    Assert-Opened 2 'E2E updater stderr sentinel'
+    Assert-Opened 2 $realFailure
     Write-Host 'PASS: the real Open update log tray menu opens the configured reader with one literal Unicode path argument'
 
     Remove-Item -LiteralPath $logPath
@@ -464,11 +496,10 @@ try {
     Assert-NoExtraOpen 2
     Write-Host 'PASS: a missing log produces a visible path-specific error while the tray remains responsive'
 
-    Remove-Item -LiteralPath $helper
     Run-ManualCheck 1
     Send-TrayEvent 0x0405
-    Assert-Opened 3 'Update check failed:'
-    Write-Host 'PASS: helper process creation failure uses the same actionable notification and diagnostic log'
+    Assert-Opened 3 $realFailure
+    Write-Host 'PASS: a subsequent real updater failure recreates the log and opens it through the new actionable notification'
 
     # The real default-reader case must pass first. Recreate the valid owned
     # registration that this hosted shell leaves without an effective default.
