@@ -83,23 +83,31 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Build both production binaries
+        id: release_build
         run: cargo build --release --locked
       - name: Verify application identity
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
         shell: pwsh
         run: ./scripts/e2e/application-identity.ps1
       - name: Tray recovery and process replacement
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
         shell: pwsh
         run: ./scripts/e2e/tray-lifecycle.ps1 -RestartExplorer
       - name: Autostart registration and tray preferences
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
         shell: powershell
         run: ./scripts/e2e/autostart.ps1
       - name: Automatic update startup preferences
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
         shell: pwsh
         run: ./scripts/e2e/startup-updates.ps1
       - name: Package the installer test fixture
+        id: installer_fixture
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
         shell: pwsh
         run: ./scripts/package-windows.ps1 -Version 999.0.1 -OutputDirectory target/package-e2e
       - name: Real WinGet upgrades and installer-managed updates
+        if: ${{ !cancelled() && steps.installer_fixture.outcome == 'success' }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -113,6 +121,7 @@ jobs:
           -ManifestDirectory target/package-e2e/winget
           -BuildScriptPath scripts/package-windows.ps1
       - name: Live upgrade and no-op behavior
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
         shell: pwsh
         run: ./scripts/e2e/updater-live.ps1 -Application brightwheel
       - name: Preserve Windows package test diagnostics

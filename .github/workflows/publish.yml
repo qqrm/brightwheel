@@ -86,21 +86,27 @@ jobs:
         run: cargo publish --dry-run --locked
 
       - name: Build release binaries
+        id: release_build
         run: cargo build --release --locked
 
       - name: Verify application identity
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
         shell: pwsh
         run: ./scripts/e2e/application-identity.ps1
 
       - name: Verify real autostart registration and tray preferences
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
         shell: powershell
         run: ./scripts/e2e/autostart.ps1
 
       - name: Package the installer test fixture
+        id: installer_fixture
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
         shell: pwsh
         run: ./scripts/package-windows.ps1 -Version 999.0.1 -OutputDirectory target/package-e2e
 
       - name: Verify real WinGet upgrades before publication
+        if: ${{ !cancelled() && steps.installer_fixture.outcome == 'success' }}
         shell: pwsh
         run: >-
           ./scripts/e2e/winget-upgrade.ps1

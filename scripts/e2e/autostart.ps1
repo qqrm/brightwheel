@@ -13,10 +13,12 @@ if (Get-Process -Name brightwheel -ErrorAction SilentlyContinue) {
     throw 'Autostart E2E requires no existing BrightWheel process.'
 }
 
-# The native menu's InvokePattern exercises the production toggle rather than
-# manufacturing a disabled preference directly in the registry.
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -AssemblyName UIAutomationTypes
+# Select the real native popup item. A Win32 popup can exist before UI
+# Automation exposes its descendants, so inspect its HMENU and displayed item
+# rectangle directly, then send an actual click through the Windows input queue.
+if (-not [Environment]::UserInteractive -or (Get-Process -Id $PID).SessionId -eq 0) {
+    throw 'Autostart E2E requires an interactive Windows desktop.'
+}
 Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
@@ -32,6 +34,127 @@ public static class AutostartDesktop {
     [DllImport("user32.dll", SetLastError = true)]
     public static extern IntPtr SendMessageTimeout(IntPtr window, uint message, UIntPtr wParam,
         IntPtr lParam, uint flags, uint timeout, out UIntPtr result);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Point { public int X, Y; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Rect { public int Left, Top, Right, Bottom; }
+    public sealed class MenuChoice {
+        public IntPtr Popup, Menu;
+        public uint Position, CommandId, State;
+        public string Text;
+    }
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern int GetMenuItemCount(IntPtr menu);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern int GetMenuString(IntPtr menu, uint item, StringBuilder text, int capacity, uint flags);
+    [DllImport("user32.dll")]
+    private static extern uint GetMenuItemID(IntPtr menu, int position);
+    [DllImport("user32.dll")]
+    private static extern uint GetMenuState(IntPtr menu, uint item, uint flags);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool GetMenuItemRect(IntPtr window, IntPtr menu, uint position, out Rect rect);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool GetCursorPos(out Point point);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")]
+    private static extern IntPtr WindowFromPoint(Point point);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MouseInput {
+        public int X, Y;
+        public uint Data, Flags, Time;
+        public UIntPtr Extra;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Input { public uint Type; public MouseInput Mouse; }
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint SendInput(uint count, Input[] inputs, int size);
+    private static IntPtr PopupMenu(IntPtr window) {
+        UIntPtr menu;
+        if (SendMessageTimeout(window, 0x01E1, UIntPtr.Zero, IntPtr.Zero, 2, 1000, out menu) == IntPtr.Zero)
+            return IntPtr.Zero;
+        return new IntPtr(unchecked((long)menu.ToUInt64()));
+    }
+    public static MenuChoice FindMenuChoice(IntPtr popup, uint processId, string expectedText, out string diagnostics) {
+        uint owner;
+        GetWindowThreadProcessId(popup, out owner);
+        diagnostics = String.Format("popup=0x{0:x}, owner={1}, visible={2}", popup.ToInt64(), owner, IsWindowVisible(popup));
+        if (owner != processId || !IsWindowVisible(popup)) return null;
+        var menu = PopupMenu(popup);
+        if (menu == IntPtr.Zero) { diagnostics += "; no HMENU yet"; return null; }
+        int count = GetMenuItemCount(menu);
+        var details = new StringBuilder(diagnostics);
+        details.AppendFormat("; HMENU=0x{0:x}, items={1}; ", menu.ToInt64(), count);
+        if (count < 1 || count > 128) { diagnostics = details.ToString(); return null; }
+        MenuChoice selected = null;
+        for (int index = 0; index < count; ++index) {
+            var text = new StringBuilder(512);
+            GetMenuString(menu, (uint)index, text, text.Capacity, 0x0400);
+            uint id = GetMenuItemID(menu, index);
+            uint state = GetMenuState(menu, (uint)index, 0x0400);
+            details.AppendFormat("[{0}] id={1}, state=0x{2:x}, '{3}'; ", index, id, state, text);
+            if (String.Equals(text.ToString().Replace("&", ""), expectedText, StringComparison.Ordinal)) {
+                if (selected != null) throw new InvalidOperationException("The popup has duplicate autostart items.");
+                selected = new MenuChoice { Popup = popup, Menu = menu, Position = (uint)index,
+                    CommandId = id, State = state, Text = text.ToString() };
+            }
+        }
+        if (selected != null) {
+            Rect rect;
+            if (!GetMenuItemRect(IntPtr.Zero, menu, selected.Position, out rect) ||
+                rect.Right <= rect.Left || rect.Bottom <= rect.Top) {
+                details.Append("selected item rectangle is not ready; ");
+                selected = null;
+            } else {
+                details.AppendFormat("selected rectangle=({0},{1},{2},{3}); ", rect.Left, rect.Top, rect.Right, rect.Bottom);
+            }
+        }
+        diagnostics = details.ToString();
+        return selected;
+    }
+    public static Point ReadCursor() {
+        Point point;
+        if (!GetCursorPos(out point)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        return point;
+    }
+    public static bool RestoreCursor(Point point) { return SetCursorPos(point.X, point.Y); }
+    public static string ClickMenuChoice(MenuChoice item, uint processId, bool expectedChecked) {
+        uint owner;
+        GetWindowThreadProcessId(item.Popup, out owner);
+        if (owner != processId || !IsWindowVisible(item.Popup) || PopupMenu(item.Popup) != item.Menu)
+            throw new InvalidOperationException("The owned popup changed before selection.");
+        uint state = GetMenuState(item.Menu, item.Position, 0x0400);
+        if (state == UInt32.MaxValue || (state & 3) != 0 || ((state & 8) != 0) != expectedChecked)
+            throw new InvalidOperationException("The autostart menu is disabled or its check mark disagrees with the saved preference.");
+        var previousDpi = SetThreadDpiAwarenessContext(new IntPtr(-4));
+        if (previousDpi == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+        try {
+            Rect rect;
+            if (!GetMenuItemRect(IntPtr.Zero, item.Menu, item.Position, out rect) ||
+                rect.Right <= rect.Left || rect.Bottom <= rect.Top)
+                throw new InvalidOperationException("The native menu item has no displayed rectangle.");
+            var point = new Point { X = rect.Left + (rect.Right - rect.Left) / 2,
+                Y = rect.Top + (rect.Bottom - rect.Top) / 2 };
+            if (WindowFromPoint(point) != item.Popup)
+                throw new InvalidOperationException("Another window covers the verified menu item.");
+            if (!SetCursorPos(point.X, point.Y)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            var inputs = new Input[2];
+            inputs[0].Mouse.Flags = 0x0002;
+            inputs[1].Mouse.Flags = 0x0004;
+            if (SendInput(2, inputs, Marshal.SizeOf(typeof(Input))) != 2) {
+                int error = Marshal.GetLastWin32Error();
+                // A partial insertion must not leave the mouse button held.
+                SendInput(1, new Input[] { inputs[1] }, Marshal.SizeOf(typeof(Input)));
+                throw new Win32Exception(error, "Windows did not accept the menu click.");
+            }
+            return String.Format("Clicked native menu item '{0}' id={1} at ({2},{3}), rectangle=({4},{5},{6},{7})",
+                item.Text, item.CommandId, point.X, point.Y, rect.Left, rect.Top, rect.Right, rect.Bottom);
+        } finally { SetThreadDpiAwarenessContext(previousDpi); }
+    }
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct StartupInfo {
         public uint cb;
@@ -149,34 +272,38 @@ function Toggle-Autostart($process, [bool]$enabled) {
     }
     $deadline = [DateTime]::UtcNow.AddSeconds(10)
     $popup = [IntPtr]::Zero
+    $item = $null
+    $diagnostics = 'No owned native popup was observed.'
+    $lastReported = ''
     do {
         $popup = Get-OwnedWindow '#32768' $null $process.Id
-        if ($popup -ne [IntPtr]::Zero) { break }
+        if ($popup -ne [IntPtr]::Zero) {
+            $item = [AutostartDesktop]::FindMenuChoice($popup, $process.Id, 'Start with Windows', [ref]$diagnostics)
+            if ($diagnostics -cne $lastReported) {
+                Write-Host "Autostart native menu: $diagnostics"
+                $lastReported = $diagnostics
+            }
+            if ($null -ne $item) { break }
+        }
         if ($process.HasExited) { throw 'BrightWheel exited while opening the tray menu.' }
         Start-Sleep -Milliseconds 100
     } while ([DateTime]::UtcNow -lt $deadline)
-    if ($popup -eq [IntPtr]::Zero) { throw 'The production tray menu did not open.' }
+    if ($null -eq $item) { throw "The production tray menu did not expose Start with Windows within 10 seconds. $diagnostics" }
 
-    $menu = [System.Windows.Automation.AutomationElement]::FromHandle($popup)
-    $condition = New-Object System.Windows.Automation.PropertyCondition(
-        [System.Windows.Automation.AutomationElement]::NameProperty, 'Start with Windows')
-    $item = $menu.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
-    if ($null -eq $item) { throw 'The tray menu has no Start with Windows item.' }
-    $pattern = $null
-    if ($item.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
-        $pattern.Invoke()
-    } elseif ($item.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) {
-        $pattern.Toggle()
-    } else { throw 'The native autostart menu item cannot be invoked.' }
-
-    $deadline = [DateTime]::UtcNow.AddSeconds(10)
-    do {
-        $registered = $null -ne $run.GetValue('BrightWheel')
-        if ($registered -eq $enabled) { break }
-        if ($process.HasExited) { throw 'BrightWheel exited while changing autostart.' }
-        Start-Sleep -Milliseconds 100
-    } while ([DateTime]::UtcNow -lt $deadline)
-    Assert-RunEntry $enabled
+    $cursor = [AutostartDesktop]::ReadCursor()
+    try {
+        Write-Host ([AutostartDesktop]::ClickMenuChoice($item, $process.Id, -not $enabled))
+        $deadline = [DateTime]::UtcNow.AddSeconds(10)
+        do {
+            $registered = $null -ne $run.GetValue('BrightWheel')
+            if ($registered -eq $enabled) { break }
+            if ($process.HasExited) { throw 'BrightWheel exited while changing autostart.' }
+            Start-Sleep -Milliseconds 100
+        } while ([DateTime]::UtcNow -lt $deadline)
+        Assert-RunEntry $enabled
+    } finally {
+        if (-not [AutostartDesktop]::RestoreCursor($cursor)) { Write-Host 'Could not restore the original test cursor position.' }
+    }
 }
 
 $temporaryRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }

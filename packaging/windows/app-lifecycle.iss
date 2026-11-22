@@ -518,12 +518,13 @@ begin
       end;
       LifecycleCapture(LifecycleTarget, LifecycleHandles);
       LifecycleWasRunning := GetArrayLength(LifecycleHandles) > 0;
-      LifecyclePrepared := True;
       if LifecycleWasRunning then LifecycleRetainLaunchToken(LifecycleHandles[0]);
+      LifecyclePrepared := True;
     end;
     LifecycleStop(LifecycleTarget, LifecycleHandles);
     LifecycleReleaseHandles(LifecycleHandles);
   except
+    if not LifecyclePrepared then LifecycleReleaseHandles(LifecycleHandles);
     Result := GetExceptionMessage;
   end;
 end;
