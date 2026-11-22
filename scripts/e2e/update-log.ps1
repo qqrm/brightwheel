@@ -118,15 +118,14 @@ $notepad = $null
 $config = $null
 $extension = $null
 $extensionExisted = $false
-$openWith = $null
-$openWithExisted = $false
-$openWithValueWritten = $false
+$commandKey = $null
+$commandChanged = $false
+$createdCommandKeys = [Collections.Generic.List[string]]::new()
 $associationChanged = $false
 # ProgIDs must fit 39 characters; retain the complete random GUID for uniqueness.
-$progId = "BWLog.$unique"
-$progIdPath = "Software\Classes\$progId"
+$missingProgId = "BWLog.$unique"
 $extensionPath = 'Software\Classes\.log'
-$openWithPath = "$extensionPath\OpenWithProgids"
+$commandPath = 'Software\Classes\txtfile\shell\open\command'
 $configPath = 'Software\BrightWheel'
 $savedConfig = @{}
 
@@ -235,59 +234,61 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Could not compile the associated log reader' }
     [IO.File]::WriteAllText($helperResult, '23')
 
-    $extension = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($extensionPath, $true)
+    $extension = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($extensionPath)
     $extensionExisted = $null -ne $extension
-    if (-not $extensionExisted) { $extension = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($extensionPath) }
-    $hadDefault = $extension.GetValueNames() -contains ''
+    $hadDefault = $extensionExisted -and $extension.GetValueNames() -contains ''
     if ($hadDefault) {
         $oldDefault = $extension.GetValue('', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
         $oldKind = $extension.GetValueKind('')
     }
+    if ($null -ne $extension) { $extension.Dispose(); $extension = $null }
     $originalExtension = if ($hadDefault) { "$oldDefault ($oldKind)" } else { '<absent>' }
     # Observe only the ProgId, not the protected hash; UserChoice is never changed.
     $userChoice = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.log\UserChoice')
     try { $userChoiceProgId = if ($null -ne $userChoice) { $userChoice.GetValue('ProgId', '<absent>') } else { '<absent>' } }
     finally { if ($null -ne $userChoice) { $userChoice.Dispose() } }
-    Write-Host "Fixture association before setup: reader='$([UpdateLogNative]::AssociatedExecutable())'; resolved ProgId='$([UpdateLogNative]::AssociatedProgId())'; HKCU default='$originalExtension'; UserChoice ProgId='$userChoiceProgId'"
-    $registration = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($progIdPath)
-    try { $registration.SetValue('', 'BrightWheel E2E log reader', [Microsoft.Win32.RegistryValueKind]::String) }
-    finally { $registration.Dispose() }
-    $shell = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("$progIdPath\shell")
-    try { $shell.SetValue('', 'open', [Microsoft.Win32.RegistryValueKind]::String) }
-    finally { $shell.Dispose() }
-    $command = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("$progIdPath\shell\open\command")
+    $baselineReader = [UpdateLogNative]::AssociatedExecutable()
+    $baselineProgId = [UpdateLogNative]::AssociatedProgId()
+    $systemNotepad = Join-Path ([Environment]::GetFolderPath('System')) 'notepad.exe'
+    Write-Host "Fixture association before setup: reader='$baselineReader'; resolved ProgId='$baselineProgId'; HKCU default='$originalExtension'; UserChoice ProgId='$userChoiceProgId'"
+    if ($baselineProgId -ine 'txtfile' -or $baselineReader -ine $systemNotepad) {
+        throw 'The disposable runner must start with the txtfile/system Notepad .log association'
+    }
+    $mergedCommandKey = [Microsoft.Win32.Registry]::ClassesRoot.OpenSubKey('txtfile\shell\open\command')
     try {
-        $command.SetValue('', ('"{0}" "%1"' -f $reader), [Microsoft.Win32.RegistryValueKind]::String)
-        $registeredCommand = $command.GetValue('')
+        if ($null -eq $mergedCommandKey -or $mergedCommandKey.GetValueNames() -contains 'DelegateExecute') {
+            throw 'The fixture requires the existing static Notepad open command; DelegateExecute is never changed'
+        }
+    } finally { if ($null -ne $mergedCommandKey) { $mergedCommandKey.Dispose() } }
+    # Keep the effective .log ProgID intact. Only replace its existing static
+    # handler command for this disposable user, recording every created parent.
+    foreach ($path in @('Software\Classes', 'Software\Classes\txtfile', 'Software\Classes\txtfile\shell',
+            'Software\Classes\txtfile\shell\open', $commandPath)) {
+        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($path, $true)
+        if ($null -eq $key) {
+            $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($path)
+            $createdCommandKeys.Add($path)
+        }
+        $key.Dispose()
     }
-    finally { $command.Dispose() }
-    # Windows File Types registration requires advertising the owned ProgID in
-    # OpenWithProgids when assigning it as the extension default. Preserve all
-    # other candidates and restore exactly our value/key afterwards.
-    $openWith = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($openWithPath, $true)
-    $openWithExisted = $null -ne $openWith
-    if (-not $openWithExisted) { $openWith = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($openWithPath) }
-    $hadOpenWithValue = $openWith.GetValueNames() -contains $progId
-    if ($hadOpenWithValue) {
-        $oldOpenWithValue = $openWith.GetValue($progId, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
-        $oldOpenWithKind = $openWith.GetValueKind($progId)
+    $commandKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($commandPath, $true)
+    $hadCommandDefault = $commandKey.GetValueNames() -contains ''
+    if ($hadCommandDefault) {
+        $oldCommandDefault = $commandKey.GetValue('', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $oldCommandKind = $commandKey.GetValueKind('')
     }
-    $openWithValueWritten = $true
-    $openWith.SetValue($progId, [byte[]]@(), [Microsoft.Win32.RegistryValueKind]::None)
-    $associationChanged = $true
-    $extension.SetValue('', $progId, [Microsoft.Win32.RegistryValueKind]::String)
-    Write-Host "Fixture registration: ProgId='$progId'; HKCU extension='$($extension.GetValue(''))'; command='$registeredCommand'; direct ProgId reader='$([UpdateLogNative]::RegisteredExecutable($progId))'"
+    $commandChanged = $true
+    $commandKey.SetValue('', ('"{0}" "%1"' -f $reader), [Microsoft.Win32.RegistryValueKind]::String)
+    $registeredCommand = $commandKey.GetValue('')
     $mergedExtension = Read-RegistryDefault ([Microsoft.Win32.Registry]::ClassesRoot) '.log'
-    $mergedClass = Read-RegistryDefault ([Microsoft.Win32.Registry]::ClassesRoot) $progId
-    $mergedCommand = Read-RegistryDefault ([Microsoft.Win32.Registry]::ClassesRoot) "$progId\shell\open\command"
-    Write-Host "Fixture merged HKCR: .log default='$mergedExtension'; class default='$mergedClass'; open command='$mergedCommand'; owned OpenWith value=$($openWith.GetValueNames() -contains $progId)"
-    # SHCNF_IDLIST | SHCNF_FLUSH waits for change delivery; do not race shell
-    # cache invalidation immediately after registering the disposable reader.
+    $mergedCommand = Read-RegistryDefault ([Microsoft.Win32.Registry]::ClassesRoot) 'txtfile\shell\open\command'
+    Write-Host "Fixture merged HKCR: .log default='$mergedExtension'; txtfile open command='$mergedCommand'; direct handler='$([UpdateLogNative]::RegisteredExecutable('txtfile'))'"
+    # SHCNF_IDLIST | SHCNF_FLUSH waits for change delivery to all consumers.
     [UpdateLogNative]::SHChangeNotify(0x08000000, 0x1000, [IntPtr]::Zero, [IntPtr]::Zero)
     try {
         Wait-For { [UpdateLogNative]::AssociatedExecutable() -ieq $reader } 'the exact effective .log reader'
     } catch {
-        throw "The test .log association did not become effective: expected='$reader'; actual='$([UpdateLogNative]::AssociatedExecutable())'; resolved ProgId='$([UpdateLogNative]::AssociatedProgId())'; direct registered reader='$([UpdateLogNative]::RegisteredExecutable($progId))'; registered command='$registeredCommand'; saved HKCU default='$originalExtension'; UserChoice ProgId='$userChoiceProgId'. $($_.Exception.Message)"
+        throw "The test .log reader did not become effective: expected='$reader'; actual='$([UpdateLogNative]::AssociatedExecutable())'; resolved ProgId='$([UpdateLogNative]::AssociatedProgId())'; direct txtfile reader='$([UpdateLogNative]::RegisteredExecutable('txtfile'))'; registered command='$registeredCommand'; saved HKCU default='$originalExtension'; UserChoice ProgId='$userChoiceProgId'. $($_.Exception.Message)"
     }
     Write-Host "Fixture association ready: reader='$([UpdateLogNative]::AssociatedExecutable())'; resolved ProgId='$([UpdateLogNative]::AssociatedProgId())'"
 
@@ -367,15 +368,18 @@ try {
     Assert-Opened 3 'Update check failed:'
     Write-Host 'PASS: helper process creation failure uses the same actionable notification and diagnostic log'
 
-    # Remove the entire owned ProgID, leaving no synthetic test handler. The
-    # default-reader case above must pass before exercising genuine absence.
-    [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($progIdPath, $false)
+    # The real default-reader case must pass first. An owned nonexistent ProgID
+    # then provides genuine absence, without changing UserChoice or txtfile.
+    $missingClass = [Microsoft.Win32.Registry]::ClassesRoot.OpenSubKey($missingProgId)
+    if ($null -ne $missingClass) { $missingClass.Dispose(); throw 'The unique absent ProgID unexpectedly exists' }
+    if ($null -eq $extension) { $extension = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($extensionPath) }
+    $associationChanged = $true
+    $extension.SetValue('', $missingProgId, [Microsoft.Win32.RegistryValueKind]::String)
     [UpdateLogNative]::SHChangeNotify(0x08000000, 0x1000, [IntPtr]::Zero, [IntPtr]::Zero)
     # HRESULT_FROM_WIN32(ERROR_NO_ASSOCIATION), not a null executable query:
     # valid packaged/COM associations need not expose ASSOCSTR_EXECUTABLE.
     Wait-For { [UpdateLogNative]::LogAssociationResult() -eq -2147023741 } 'explicit HRESULT 0x80070483 for no .log association'
     Invoke-TrayMenu 1005 'Open update log'
-    $systemNotepad = Join-Path ([Environment]::GetFolderPath('System')) 'notepad.exe'
     Wait-For {
         $script:fallbacks = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($process.Id)" | Where-Object {
             $_.ExecutablePath -ieq $systemNotepad -and $_.CommandLine
@@ -429,18 +433,12 @@ try {
         }
     }
     Invoke-UpdateLogCleanup {
-        if ($openWithValueWritten) {
-            if ($hadOpenWithValue) { $openWith.SetValue($progId, $oldOpenWithValue, $oldOpenWithKind) }
-            else { $openWith.DeleteValue($progId, $false) }
+        if ($commandChanged) {
+            if ($hadCommandDefault) { $commandKey.SetValue('', $oldCommandDefault, $oldCommandKind) }
+            else { $commandKey.DeleteValue('', $false) }
         }
     }
-    Invoke-UpdateLogCleanup {
-        if ($null -ne $openWith) {
-            $removeOpenWith = -not $openWithExisted -and $openWith.ValueCount -eq 0 -and $openWith.SubKeyCount -eq 0
-            $openWith.Dispose()
-            if ($removeOpenWith) { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($openWithPath, $false) }
-        }
-    }
+    Invoke-UpdateLogCleanup { if ($null -ne $commandKey) { $commandKey.Dispose() } }
     Invoke-UpdateLogCleanup {
         if ($associationChanged) {
             if ($hadDefault) { $extension.SetValue('', $oldDefault, $oldKind) }
@@ -454,7 +452,17 @@ try {
             if ($removeExtension) { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($extensionPath, $false) }
         }
     }
-    Invoke-UpdateLogCleanup { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($progIdPath, $false) }
+    for ($index = $createdCommandKeys.Count - 1; $index -ge 0; $index--) {
+        $path = $createdCommandKeys[$index]
+        Invoke-UpdateLogCleanup {
+            $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($path)
+            if ($null -ne $key) {
+                try { $empty = $key.ValueCount -eq 0 -and $key.SubKeyCount -eq 0 }
+                finally { $key.Dispose() }
+                if ($empty) { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($path, $false) }
+            }
+        }
+    }
     Invoke-UpdateLogCleanup { [UpdateLogNative]::SHChangeNotify(0x08000000, 0x1000, [IntPtr]::Zero, [IntPtr]::Zero) }
     Invoke-UpdateLogCleanup {
         if (Test-Path -LiteralPath $runtimeLog) { Get-Content -LiteralPath $runtimeLog -Tail 12 | ForEach-Object { Write-Host $_.Substring(0, [Math]::Min($_.Length, 250)) } }
