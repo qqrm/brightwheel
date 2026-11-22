@@ -111,7 +111,6 @@ $helperResult = Join-Path $helperDirectory 'result-code.txt'
 $data = Join-Path $install 'local data'
 $logPath = Join-Path $data 'BrightWheel\updater.log'
 $runtimeLog = Join-Path $data 'BrightWheel\runtime.log'
-$originalLocalAppData = $env:LOCALAPPDATA
 $originalSystemRoot = $env:SystemRoot
 $process = $null
 $notepad = $null
@@ -302,10 +301,15 @@ try {
     }
     $config.SetValue('AutoStartConfigured', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
     $config.SetValue('AutoUpdateEnabled', 0, [Microsoft.Win32.RegistryValueKind]::DWord)
-    $env:LOCALAPPDATA = $data
-    $env:SystemRoot = $fakeSystemRoot
-    try { $process = Start-Process -FilePath $target -ArgumentList '--skip-startup-update' -PassThru }
-    finally { $env:LOCALAPPDATA = $originalLocalAppData; $env:SystemRoot = $originalSystemRoot }
+    # Override only the application's environment. The test host must keep its
+    # real SystemRoot so Windows can load the modules used to launch processes.
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $target
+    $startInfo.Arguments = '--skip-startup-update'
+    $startInfo.UseShellExecute = $false
+    $startInfo.EnvironmentVariables['LOCALAPPDATA'] = $data
+    $startInfo.EnvironmentVariables['SystemRoot'] = $fakeSystemRoot
+    $process = [Diagnostics.Process]::Start($startInfo)
     Wait-For {
         $script:window = [UpdateLogNative]::FindWindow('BrightWheel.HiddenWindow', 'BrightWheel')
         [uint32]$ownerPid = 0
@@ -398,8 +402,6 @@ try {
     Assert-NoExtraOpen 3
     Write-Host 'PASS: an explicitly absent .log association opens the installed system Notepad with the exact document argument'
 } finally {
-    $env:LOCALAPPDATA = $originalLocalAppData
-    $env:SystemRoot = $originalSystemRoot
     $cleanupErrors = [Collections.Generic.List[string]]::new()
     function Invoke-UpdateLogCleanup([scriptblock]$action) {
         try { & $action } catch { $cleanupErrors.Add($_.Exception.Message) }
