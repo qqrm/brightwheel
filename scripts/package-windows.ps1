@@ -38,18 +38,22 @@ $OutputDirectory = (Resolve-Path -LiteralPath $OutputDirectory).Path
 $managedArtifacts = @()
 if ($stable) {
     if (-not $CompilerPath) {
-        $compiler = Get-Command ISCC.exe -ErrorAction SilentlyContinue
-        if ($compiler) { $CompilerPath = $compiler.Source }
+        $installedCompiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe'
+        if (Test-Path -LiteralPath $installedCompiler -PathType Leaf) { $CompilerPath = $installedCompiler }
         else {
-            $CompilerPath = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe'
+            $compiler = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+            if ($compiler) { $CompilerPath = $compiler.Source }
         }
     }
-    if (-not (Test-Path -LiteralPath $CompilerPath -PathType Leaf)) {
+    if (-not $CompilerPath -or -not (Test-Path -LiteralPath $CompilerPath -PathType Leaf)) {
         throw 'Inno Setup 6 is required. Install it or supply -CompilerPath.'
     }
-    if ([Diagnostics.FileVersionInfo]::GetVersionInfo($CompilerPath).FileMajorPart -ne 6) {
-        throw 'The native lifecycle declarations require the 32-bit Inno Setup 6 compiler.'
-    }
+    $CompilerPath = (Resolve-Path -LiteralPath $CompilerPath).Path
+    $compilerInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($CompilerPath)
+    Write-Host "Compiler launcher: $CompilerPath"
+    Write-Host "Launcher FileVersion='$($compilerInfo.FileVersion)', ProductVersion='$($compilerInfo.ProductVersion)'"
+    # ISCC's fixed numeric version resource can be 0.0.0.0. The shared
+    # installer source checks the compiler-provided ISPP VER value instead.
 
     & $CompilerPath /Qp "/DAppVersion=$Version" "/DBinaryDirectory=$BinaryDirectory" "/DOutputDirectory=$OutputDirectory" (Join-Path $root 'packaging/windows/brightwheel.iss')
     if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE." }

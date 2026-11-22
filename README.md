@@ -19,6 +19,15 @@ Scrolling accelerates from precise 2% steps to 10% steps during a continuous
 gesture. Startup with Windows is enabled on first launch and can be disabled
 from the tray menu.
 
+Launching BrightWheel again restarts the running instance. The new launch asks
+the previous instance to exit, then terminates it if it does not respond within
+1.5 seconds. This also recovers an instance whose tray icon is unavailable.
+Overlapping launches are serialized, so only one instance owns the tray.
+
+The tray icon is restored after Explorer recreates the taskbar, and its
+registration is checked again after display changes and sleep/resume. A
+temporarily unavailable shell is retried without blocking the UI.
+
 ## Requirements
 
 - 64-bit Windows 10 or 11 for the prebuilt release;
@@ -51,7 +60,7 @@ per-user migration path.
 This support reaches UniGetUI when a release containing the installer is
 published **and its installer manifest is accepted in
 [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs/tree/master/manifests/q/QQRM/BrightWheel)**.
-The current `0.1.9` catalog entry still distributes a portable executable and
+The published `0.1.9` catalog entry distributes a portable executable and
 does not gain these behaviors from a source change alone.
 
 ### Updating without manually exiting
@@ -88,6 +97,12 @@ skips the startup check for that restart to avoid repeated update attempts; the
 next normal launch checks again. Changing the checkbox does not cancel a check
 already in progress. The local update log is at
 `%LOCALAPPDATA%\BrightWheel\updater.log`. No monitor data is uploaded.
+
+Runtime lifecycle events and errors are recorded separately in
+`%LOCALAPPDATA%\BrightWheel\runtime.log`: version, launch, relaunch, shell/display
+and resume notifications, failed tray recovery, and shutdown. This local log is
+rotated at 256 KiB, retaining one previous file. Logging is best-effort and does
+not record typed text or mouse movements.
 
 When installing with `cargo install brightwheel --force` instead, a running
 executable still needs to be closed before Cargo can overwrite it.
@@ -147,6 +162,13 @@ cargo test --all-targets --locked
 
 Hardware-independent behavior is covered by automated tests. DDC/CI and HDR
 still require manual testing with a compatible monitor.
+
+The Windows CI also runs `scripts/e2e/tray-lifecycle.ps1 -RestartExplorer`
+against the production executable. It removes the registered icon and verifies
+recovery through actual broadcast delivery, repeats display/resume notifications,
+restarts Explorer, and checks normal, unresponsive, and overlapping process
+replacement. These notification tests do not claim a physical suspend/resume
+test; that still needs a Windows machine and its actual display driver.
 
 ### Windows installation acceptance tests
 

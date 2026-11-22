@@ -11,32 +11,32 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    FindWindowExW, GetMessageW, HC_ACTION, HICON, HWND_MESSAGE, IDI_APPLICATION, LoadCursorW,
-    LoadIconW, MSG, MSLLHOOKSTRUCT, PostMessageW, PostQuitMessage, RegisterClassW,
-    RegisterWindowMessageW, SetWindowsHookExW, TranslateMessage, WH_MOUSE_LL, WM_APP,
-    WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_RBUTTONUP, WNDCLASSW,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+    HC_ACTION, HICON, IDI_APPLICATION, KillTimer, LoadCursorW, LoadIconW, MSG, MSLLHOOKSTRUCT,
+    PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PostMessageW, PostQuitMessage, RegisterClassW,
+    RegisterWindowMessageW, SetTimer, SetWindowsHookExW, TranslateMessage, WH_MOUSE_LL, WM_APP,
+    WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_POWERBROADCAST, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
 };
 
+use super::diagnostics;
 use super::gesture::{
     WheelAccelerator, WheelEvent, is_double_click, needs_tray_hit_test, steps_from_mouse_data,
 };
-use super::platform::{MouseHook, SingleInstance, power_off_monitors, show_error, wide};
+use super::lifecycle::{self, EXIT_FOR_UPDATE, WINDOW_CLASS, WINDOW_TITLE};
+use super::platform::{MouseHook, power_off_monitors, show_error, wide};
 use super::tray_icon::{self, MenuCommand, Status};
 use super::updater;
 
-const WINDOW_CLASS: &str = "BrightWheel.HiddenWindow";
-const WINDOW_TITLE: &str = "BrightWheel";
-const INSTANCE_MUTEX: &str = "Local\\BrightWheel.Singleton";
 const BULB_ICON_RESOURCE_ID: usize = 2;
 const BRIGHTNESS_UPDATED: u32 = WM_APP + 2;
 const TOGGLE_HDR: u32 = WM_APP + 3;
 const POWER_OFF_MONITORS: u32 = WM_APP + 4;
-const EXIT_FOR_UPDATE: u32 = WM_APP + 5;
 pub(super) const UPDATE_RESULT: u32 = WM_APP + 6;
 const STARTUP_UPDATE: u32 = WM_APP + 7;
 const BATCH_WINDOW: Duration = Duration::from_millis(40);
+const RECOVERY_TIMER: usize = 1;
+const RECOVERY_ATTEMPTS: u32 = 20;
 
 static STATE: SharedState = SharedState::new();
 
@@ -50,6 +50,7 @@ struct SharedState {
     interaction_active: AtomicBool,
     wheel_generation: AtomicU32,
     last_left_click: AtomicU32,
+    recovery_remaining: AtomicU32,
 }
 
 impl SharedState {
@@ -64,6 +65,7 @@ impl SharedState {
             interaction_active: AtomicBool::new(false),
             wheel_generation: AtomicU32::new(0),
             last_left_click: AtomicU32::new(0),
+            recovery_remaining: AtomicU32::new(0),
         }
     }
 
@@ -92,38 +94,12 @@ impl SharedState {
     }
 }
 
-/// Ask the existing message-only window to terminate without starting a second tray instance.
-pub(crate) fn request_running_instance_exit() -> Result<(), Box<dyn Error>> {
-    let class_name = wide(WINDOW_CLASS);
-    let window_title = wide(WINDOW_TITLE);
-    // SAFETY: HWND_MESSAGE restricts the search to message-only windows;
-    // both class and title strings are terminated and valid for the call.
-    let window = unsafe {
-        FindWindowExW(
-            HWND_MESSAGE,
-            ptr::null_mut(),
-            class_name.as_ptr(),
-            window_title.as_ptr(),
-        )
-    };
-    if window.is_null() {
-        return Err("running BrightWheel window was not found".into());
-    }
-    // SAFETY: this is a private application message without pointers.
-    if unsafe { PostMessageW(window, EXIT_FOR_UPDATE, 0, 0) } == 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    Ok(())
-}
-
-pub(crate) fn run(skip_startup_update: bool) -> Result<(), Box<dyn Error>> {
-    let instance = SingleInstance::acquire(INSTANCE_MUTEX)?;
-    if instance.already_running() {
+pub(crate) fn run(skip_startup_update: bool, skip_if_running: bool) -> Result<(), Box<dyn Error>> {
+    let Some((instance, startup_gate)) = lifecycle::begin(skip_if_running)? else {
         return Ok(());
-    }
+    };
 
     brightwheel::autostart::initialize_default()?;
-    initialize_status();
 
     // SAFETY: a null module name requests the current executable module.
     let module = unsafe { GetModuleHandleW(ptr::null()) };
@@ -162,7 +138,8 @@ pub(crate) fn run(skip_startup_update: bool) -> Result<(), Box<dyn Error>> {
     STATE.icon.store(icon as usize, Ordering::Release);
 
     // SAFETY: the registered class and all string pointers are valid; this
-    // creates a message-only window with no application-owned creation data.
+    // creates an invisible top-level window. Message-only windows cannot receive
+    // the shell's TaskbarCreated or power/display broadcasts.
     let window = unsafe {
         CreateWindowExW(
             0,
@@ -173,7 +150,7 @@ pub(crate) fn run(skip_startup_update: bool) -> Result<(), Box<dyn Error>> {
             0,
             0,
             0,
-            HWND_MESSAGE,
+            ptr::null_mut(),
             ptr::null_mut(),
             module,
             ptr::null(),
@@ -183,6 +160,9 @@ pub(crate) fn run(skip_startup_update: bool) -> Result<(), Box<dyn Error>> {
         return Err(io::Error::last_os_error().into());
     }
     STATE.window.store(window as usize, Ordering::Release);
+    // Another launch can now locate and replace this instance, even if monitor
+    // discovery or later initialization stalls.
+    drop(startup_gate);
 
     start_brightness_worker()?;
 
@@ -200,13 +180,7 @@ pub(crate) fn run(skip_startup_update: bool) -> Result<(), Box<dyn Error>> {
         .taskbar_created
         .store(taskbar_message, Ordering::Release);
 
-    if let Err(error) = tray_icon::add(window, icon, STATE.status()) {
-        // SAFETY: `window` was created by this thread and has not been destroyed.
-        unsafe {
-            DestroyWindow(window);
-        }
-        return Err(error.into());
-    }
+    start_tray_recovery(window, "initial tray registration");
 
     // SAFETY: the callback has the required ABI and `module` remains loaded for
     // the process lifetime. Thread ID zero installs the global low-level hook.
@@ -252,7 +226,23 @@ fn start_brightness_worker() -> Result<(), Box<dyn Error>> {
         .map_err(|_| "wheel worker was already initialized")?;
     thread::Builder::new()
         .name("brightness-worker".to_owned())
-        .spawn(move || brightness_worker(receiver))?;
+        .spawn(move || {
+            // DDC/driver calls must not block window creation or the UI thread.
+            initialize_status();
+            let window = STATE.window();
+            if !window.is_null() {
+                // SAFETY: status is transported as a scalar; no pointers escape.
+                unsafe {
+                    PostMessageW(
+                        window,
+                        BRIGHTNESS_UPDATED,
+                        STATE.brightness.load(Ordering::Relaxed) as WPARAM,
+                        0,
+                    );
+                }
+            }
+            brightness_worker(receiver);
+        })?;
     Ok(())
 }
 
@@ -281,11 +271,8 @@ unsafe extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if message == STATE.taskbar_created.load(Ordering::Acquire) {
-        let icon = STATE.icon();
-        if !icon.is_null() {
-            let _ = tray_icon::add(window, icon, STATE.status());
-        }
+    if message != 0 && message == STATE.taskbar_created.load(Ordering::Acquire) {
+        start_tray_recovery(window, "TaskbarCreated");
         return 0;
     }
 
@@ -301,7 +288,7 @@ unsafe extern "system" fn window_proc(
             match brightwheel::hdr::toggle() {
                 Ok(state) => {
                     STATE.hdr.store(i32::from(state.enabled), Ordering::Relaxed);
-                    tray_icon::update(window, STATE.icon(), STATE.status());
+                    start_tray_recovery(window, "HDR status changed");
                 }
                 Err(error) => show_error(&error.to_string()),
             }
@@ -309,7 +296,7 @@ unsafe extern "system" fn window_proc(
         }
         BRIGHTNESS_UPDATED => {
             STATE.brightness.store(wparam as i32, Ordering::Relaxed);
-            tray_icon::update(window, STATE.icon(), STATE.status());
+            start_tray_recovery(window, "brightness status changed");
             0
         }
         POWER_OFF_MONITORS => {
@@ -319,7 +306,8 @@ unsafe extern "system" fn window_proc(
             0
         }
         EXIT_FOR_UPDATE => {
-            // SAFETY: a live message-only window is destroyed on its owner
+            diagnostics::log("shutdown requested by relaunch/updater");
+            // SAFETY: a live application window is destroyed on its owner
             // thread, which cleans up the tray icon and message loop.
             unsafe {
                 DestroyWindow(window);
@@ -344,7 +332,26 @@ unsafe extern "system" fn window_proc(
             }
             0
         }
+        WM_DISPLAYCHANGE => {
+            STATE.cancel_wheel_interaction();
+            start_tray_recovery(window, "display configuration changed");
+            0
+        }
+        WM_POWERBROADCAST => {
+            STATE.cancel_wheel_interaction();
+            if wparam == PBT_APMRESUMEAUTOMATIC as usize || wparam == PBT_APMRESUMESUSPEND as usize
+            {
+                start_tray_recovery(window, "system resumed");
+            }
+            1
+        }
+        WM_TIMER if wparam == RECOVERY_TIMER => {
+            recover_tray(window);
+            0
+        }
         WM_DESTROY => {
+            // SAFETY: timer belongs to this window and can be removed if absent.
+            unsafe { KillTimer(window, RECOVERY_TIMER) };
             tray_icon::remove(window);
             STATE.window.store(0, Ordering::Release);
             // SAFETY: this callback runs on the message-loop thread.
@@ -356,6 +363,50 @@ unsafe extern "system" fn window_proc(
         // SAFETY: unhandled messages must be forwarded to the default window
         // procedure with their original parameters.
         _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
+    }
+}
+
+fn start_tray_recovery(window: HWND, reason: &str) {
+    // Log lifecycle events, not every mouse-wheel update.
+    if reason != "brightness status changed" && reason != "HDR status changed" {
+        diagnostics::log(reason);
+    }
+    STATE
+        .recovery_remaining
+        .store(RECOVERY_ATTEMPTS, Ordering::Relaxed);
+    recover_tray(window);
+}
+
+fn recover_tray(window: HWND) {
+    let remaining = STATE.recovery_remaining.load(Ordering::Relaxed);
+    if remaining == 0 {
+        return;
+    }
+    match tray_icon::restore(window, STATE.icon(), STATE.status()) {
+        Ok(()) => {
+            STATE.recovery_remaining.store(0, Ordering::Relaxed);
+            // SAFETY: timer belongs to this HWND; removing a missing timer is harmless.
+            unsafe { KillTimer(window, RECOVERY_TIMER) };
+        }
+        Err(error) => {
+            STATE
+                .recovery_remaining
+                .store(remaining - 1, Ordering::Relaxed);
+            if remaining == 1 {
+                // SAFETY: this event-triggered retry budget is exhausted.
+                unsafe { KillTimer(window, RECOVERY_TIMER) };
+                diagnostics::log(&format!("tray recovery exhausted: {error}"));
+            } else {
+                // SAFETY: a window-owned timer posts WM_TIMER to this UI thread.
+                if unsafe { SetTimer(window, RECOVERY_TIMER, 500, None) } == 0 {
+                    STATE.recovery_remaining.store(0, Ordering::Relaxed);
+                    diagnostics::log(&format!(
+                        "cannot schedule tray recovery: {}",
+                        io::Error::last_os_error()
+                    ));
+                }
+            }
+        }
     }
 }
 

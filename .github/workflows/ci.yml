@@ -87,6 +87,9 @@ jobs:
       - name: Verify application identity
         shell: pwsh
         run: ./scripts/e2e/application-identity.ps1
+      - name: Tray recovery and process replacement
+        shell: pwsh
+        run: ./scripts/e2e/tray-lifecycle.ps1 -RestartExplorer
       - name: Autostart registration and tray preferences
         shell: powershell
         run: ./scripts/e2e/autostart.ps1
