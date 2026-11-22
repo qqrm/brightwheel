@@ -1,10 +1,11 @@
+use std::cell::Cell;
 use std::ffi::OsStr;
 use std::io;
 use std::mem;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIIF_LARGE_ICON, NIIF_USER,
@@ -18,6 +19,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::brightness_icon::BrightnessIcon;
+use super::diagnostics;
 use super::platform::wide;
 
 pub(crate) const CALLBACK_MESSAGE: u32 = WM_APP + 1;
@@ -28,12 +30,29 @@ const MENU_AUTOSTART: usize = 1001;
 const MENU_EXIT: usize = 1002;
 const MENU_UPDATE: usize = 1003;
 const MENU_AUTO_UPDATE: usize = 1004;
+const MENU_UPDATE_LOG: usize = 1005;
+
+thread_local! {
+    // Shell callbacks have no per-balloon token. Bind an action only to the
+    // latest notification. A hidden/timed-out banner may still be clickable in
+    // notification history, so retain its action until replacement or a click.
+    static NOTIFICATION_ACTION: Cell<NotificationAction> = const {
+        Cell::new(NotificationAction::None)
+    };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NotificationAction {
+    None,
+    OpenUpdateLog,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MenuCommand {
     ToggleAutostart,
     ToggleAutomaticUpdates,
     CheckUpdates,
+    OpenUpdateLog,
     Exit,
 }
 
@@ -86,6 +105,19 @@ pub(crate) fn restore(window: HWND, icon: HICON, status: Status) -> io::Result<(
 }
 
 pub(crate) fn notify(window: HWND, title: &str, message: &str) {
+    notify_with_action(window, title, message, NotificationAction::None);
+}
+
+pub(crate) fn notify_update_failure(window: HWND) {
+    notify_with_action(
+        window,
+        "BrightWheel update failed",
+        "Click to open the update log. You can also open it from the tray menu.",
+        NotificationAction::OpenUpdateLog,
+    );
+}
+
+fn notify_with_action(window: HWND, title: &str, message: &str, action: NotificationAction) {
     let mut data = data(window);
     data.uFlags = NIF_INFO;
     data.hBalloonIcon = application_icon();
@@ -98,12 +130,29 @@ pub(crate) fn notify(window: HWND, title: &str, message: &str) {
     copy_wide(&mut data.szInfo, message);
     // SAFETY: data contains valid fixed-length UTF-16 strings and identifies
     // the existing notification-area icon.
-    unsafe {
-        Shell_NotifyIconW(NIM_MODIFY, &data);
+    if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) } != 0 {
+        NOTIFICATION_ACTION.set(action);
+        diagnostics::log(&format!("update notification submitted: {action:?}"));
     }
 }
 
+pub(crate) fn callback_event(lparam: LPARAM) -> Option<u32> {
+    let packed = lparam as u32;
+    // NOTIFYICON_VERSION_4 packs the icon ID in HIWORD(lParam), and the
+    // notification event in LOWORD(lParam); wParam contains coordinates.
+    (packed >> 16 == ICON_ID).then_some(packed & 0xffff)
+}
+
+pub(crate) fn take_notification_action() -> NotificationAction {
+    NOTIFICATION_ACTION.replace(NotificationAction::None)
+}
+
+pub(crate) fn clear_notification_action() {
+    NOTIFICATION_ACTION.set(NotificationAction::None);
+}
+
 pub(crate) fn remove(window: HWND) {
+    clear_notification_action();
     let data = data(window);
     // SAFETY: `data` identifies the icon associated with this window.
     unsafe {
@@ -161,6 +210,7 @@ pub(crate) fn context_menu(
     } else {
         menu.append(MF_STRING, MENU_UPDATE, "Check for updates")?;
     }
+    menu.append(MF_STRING, MENU_UPDATE_LOG, "Open update log")?;
     menu.append_separator()?;
     menu.append(MF_STRING, MENU_EXIT, "Exit")?;
 
@@ -197,6 +247,7 @@ pub(crate) fn context_menu(
         MENU_AUTOSTART => Some(MenuCommand::ToggleAutostart),
         MENU_AUTO_UPDATE => Some(MenuCommand::ToggleAutomaticUpdates),
         MENU_UPDATE => Some(MenuCommand::CheckUpdates),
+        MENU_UPDATE_LOG => Some(MenuCommand::OpenUpdateLog),
         MENU_EXIT => Some(MenuCommand::Exit),
         _ => None,
     })
@@ -285,7 +336,15 @@ impl Drop for Menu {
 
 #[cfg(test)]
 mod tests {
-    use super::{Status, copy_wide, tooltip};
+    use super::{Status, callback_event, copy_wide, tooltip};
+
+    #[test]
+    fn decodes_version_four_callbacks_for_only_our_icon() {
+        assert_eq!(callback_event(0x0001_0405), Some(0x0405));
+        assert_eq!(callback_event(0x0001_007b), Some(0x007b));
+        assert_eq!(callback_event(0x0002_0405), None);
+        assert_eq!(callback_event(0x0405), None);
+    }
 
     #[test]
     fn formats_complete_and_unavailable_statuses() {

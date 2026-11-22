@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+use windows_sys::Win32::UI::Shell::NIN_BALLOONUSERCLICK;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     HC_ACTION, HICON, IDI_APPLICATION, KillTimer, LoadCursorW, LoadIconW, MSG, MSLLHOOKSTRUCT,
@@ -25,7 +26,7 @@ use super::gesture::{
 };
 use super::lifecycle::{self, EXIT_FOR_UPDATE, WINDOW_CLASS, WINDOW_TITLE};
 use super::platform::{MouseHook, power_off_monitors, show_error, wide};
-use super::tray_icon::{self, MenuCommand, Status};
+use super::tray_icon::{self, MenuCommand, NotificationAction, Status};
 use super::updater;
 
 const BULB_ICON_RESOURCE_ID: usize = 2;
@@ -278,9 +279,15 @@ unsafe extern "system" fn window_proc(
 
     match message {
         tray_icon::CALLBACK_MESSAGE => {
-            let event = lparam as u32 & 0xffff;
-            if event == WM_CONTEXTMENU || event == WM_RBUTTONUP {
-                show_context_menu(window);
+            match tray_icon::callback_event(lparam) {
+                Some(WM_CONTEXTMENU | WM_RBUTTONUP) => show_context_menu(window),
+                Some(NIN_BALLOONUSERCLICK)
+                    if tray_icon::take_notification_action()
+                        == NotificationAction::OpenUpdateLog =>
+                {
+                    updater::open_log(window);
+                }
+                _ => {}
             }
             0
         }
@@ -315,14 +322,11 @@ unsafe extern "system" fn window_proc(
             0
         }
         UPDATE_RESULT => {
+            diagnostics::log(&format!("manual update result: {wparam}"));
             match wparam {
                 10 => tray_icon::notify(window, "BrightWheel", "Already up to date"),
                 0 => {}
-                _ => tray_icon::notify(
-                    window,
-                    "BrightWheel update failed",
-                    "See %LOCALAPPDATA%\\BrightWheel\\updater.log",
-                ),
+                _ => tray_icon::notify_update_failure(window),
             }
             0
         }
@@ -549,6 +553,7 @@ fn show_context_menu(window: HWND) {
             }
         }
         Ok(Some(MenuCommand::CheckUpdates)) => updater::start(window, updater::CheckMode::Manual),
+        Ok(Some(MenuCommand::OpenUpdateLog)) => updater::open_log(window),
         Ok(Some(MenuCommand::Exit)) => {
             // SAFETY: `window` is the current live message window.
             unsafe {

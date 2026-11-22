@@ -267,7 +267,8 @@ function Assert-RunEntry([bool]$enabled) {
 
 function Toggle-Autostart($process, [bool]$enabled) {
     $window = Wait-Ready $process
-    if (-not [AutostartDesktop]::PostMessage($window, 0x8001, [UIntPtr]::Zero, [IntPtr]0x007B)) {
+    # NOTIFYICON_VERSION_4 packs icon ID 1 in HIWORD and WM_CONTEXTMENU in LOWORD.
+    if (-not [AutostartDesktop]::PostMessage($window, 0x8001, [UIntPtr]::Zero, [IntPtr]0x0001007B)) {
         throw 'Could not open the production tray menu.'
     }
     $deadline = [DateTime]::UtcNow.AddSeconds(10)

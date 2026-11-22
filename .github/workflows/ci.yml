@@ -97,6 +97,10 @@ jobs:
         if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
         shell: powershell
         run: ./scripts/e2e/autostart.ps1
+      - name: Update notification and log reader
+        if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
+        shell: pwsh
+        run: ./scripts/e2e/update-log.ps1
       - name: Automatic update startup preferences
         if: ${{ !cancelled() && steps.release_build.outcome == 'success' }}
         shell: pwsh
