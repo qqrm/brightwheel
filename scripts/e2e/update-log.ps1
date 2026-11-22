@@ -50,6 +50,10 @@ public static class UpdateLogNative {
     private static extern int Shell_NotifyIconGetRect(ref Identifier identifier, out Rect rect);
     [DllImport("shell32.dll")]
     public static extern void SHChangeNotify(uint eventId, uint flags, IntPtr item1, IntPtr item2);
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CommandLineToArgvW(string commandLine, out int count);
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr LocalFree(IntPtr memory);
     [DllImport("shlwapi.dll", CharSet = CharSet.Unicode)]
     private static extern int AssocQueryString(uint flags, uint kind, string association, string extra,
         StringBuilder output, ref uint length);
@@ -58,14 +62,29 @@ public static class UpdateLogNative {
         Rect rect;
         return Shell_NotifyIconGetRect(ref id, out rect) == 0;
     }
-    public static string Association(uint kind) {
+    public static string Association(uint kind, string association, uint flags) {
         uint size = 32768;
         var output = new StringBuilder((int)size);
-        int result = AssocQueryString(0, kind, ".log", null, output, ref size);
+        int result = AssocQueryString(flags, kind, association, null, output, ref size);
         return result == 0 ? output.ToString() : "<HRESULT 0x" + result.ToString("X8") + ">";
     }
-    public static string AssociatedExecutable() { return Association(2); }
-    public static string AssociatedProgId() { return Association(20); }
+    public static string AssociatedExecutable() { return Association(2, ".log", 0); }
+    public static string AssociatedProgId() { return Association(20, ".log", 0); }
+    public static string RegisteredExecutable(string progId) { return Association(2, progId, 0x800); }
+    public static int LogAssociationResult() {
+        uint size = 256;
+        return AssocQueryString(0x400, 20, ".log", null, new StringBuilder((int)size), ref size);
+    }
+    public static string[] Arguments(string commandLine) {
+        int count;
+        IntPtr values = CommandLineToArgvW(commandLine, out count);
+        if (values == IntPtr.Zero) throw new System.ComponentModel.Win32Exception();
+        try {
+            var result = new string[count];
+            for (int i = 0; i < count; i++) result[i] = Marshal.PtrToStringUni(Marshal.ReadIntPtr(values, i * IntPtr.Size));
+            return result;
+        } finally { LocalFree(values); }
+    }
     public static string DialogText(IntPtr dialog) {
         var output = new StringBuilder();
         for (IntPtr child = GetWindow(dialog, 5); child != IntPtr.Zero; child = GetWindow(child, 2)) {
@@ -95,11 +114,13 @@ $runtimeLog = Join-Path $data 'BrightWheel\runtime.log'
 $originalLocalAppData = $env:LOCALAPPDATA
 $originalSystemRoot = $env:SystemRoot
 $process = $null
+$notepad = $null
 $config = $null
 $extension = $null
 $extensionExisted = $false
 $associationChanged = $false
-$progId = "BrightWheel.UpdateLog.E2E.$unique"
+# ProgIDs must fit 39 characters; retain the complete random GUID for uniqueness.
+$progId = "BWLog.$unique"
 $progIdPath = "Software\Classes\$progId"
 $extensionPath = 'Software\Classes\.log'
 $configPath = 'Software\BrightWheel'
@@ -216,18 +237,28 @@ try {
     try { $userChoiceProgId = if ($null -ne $userChoice) { $userChoice.GetValue('ProgId', '<absent>') } else { '<absent>' } }
     finally { if ($null -ne $userChoice) { $userChoice.Dispose() } }
     Write-Host "Fixture association before setup: reader='$([UpdateLogNative]::AssociatedExecutable())'; resolved ProgId='$([UpdateLogNative]::AssociatedProgId())'; HKCU default='$originalExtension'; UserChoice ProgId='$userChoiceProgId'"
+    $registration = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($progIdPath)
+    try { $registration.SetValue('', 'BrightWheel E2E log reader', [Microsoft.Win32.RegistryValueKind]::String) }
+    finally { $registration.Dispose() }
+    $shell = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("$progIdPath\shell")
+    try { $shell.SetValue('', 'open', [Microsoft.Win32.RegistryValueKind]::String) }
+    finally { $shell.Dispose() }
     $command = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("$progIdPath\shell\open\command")
-    try { $command.SetValue('', ('"{0}" "%1"' -f $reader), [Microsoft.Win32.RegistryValueKind]::String) }
+    try {
+        $command.SetValue('', ('"{0}" "%1"' -f $reader), [Microsoft.Win32.RegistryValueKind]::String)
+        $registeredCommand = $command.GetValue('')
+    }
     finally { $command.Dispose() }
     $associationChanged = $true
     $extension.SetValue('', $progId, [Microsoft.Win32.RegistryValueKind]::String)
+    Write-Host "Fixture registration: ProgId='$progId'; HKCU extension='$($extension.GetValue(''))'; command='$registeredCommand'; direct ProgId reader='$([UpdateLogNative]::RegisteredExecutable($progId))'"
     # SHCNF_IDLIST | SHCNF_FLUSH waits for change delivery; do not race shell
     # cache invalidation immediately after registering the disposable reader.
     [UpdateLogNative]::SHChangeNotify(0x08000000, 0x1000, [IntPtr]::Zero, [IntPtr]::Zero)
     try {
         Wait-For { [UpdateLogNative]::AssociatedExecutable() -ieq $reader } 'the exact effective .log reader'
     } catch {
-        throw "The test .log association did not become effective: expected='$reader'; actual='$([UpdateLogNative]::AssociatedExecutable())'; resolved ProgId='$([UpdateLogNative]::AssociatedProgId())'; saved HKCU default='$originalExtension'; UserChoice ProgId='$userChoiceProgId'. $($_.Exception.Message)"
+        throw "The test .log association did not become effective: expected='$reader'; actual='$([UpdateLogNative]::AssociatedExecutable())'; resolved ProgId='$([UpdateLogNative]::AssociatedProgId())'; direct registered reader='$([UpdateLogNative]::RegisteredExecutable($progId))'; registered command='$registeredCommand'; saved HKCU default='$originalExtension'; UserChoice ProgId='$userChoiceProgId'. $($_.Exception.Message)"
     }
     Write-Host "Fixture association ready: reader='$([UpdateLogNative]::AssociatedExecutable())'; resolved ProgId='$([UpdateLogNative]::AssociatedProgId())'"
 
@@ -306,34 +337,86 @@ try {
     Send-TrayEvent 0x0405
     Assert-Opened 3 'Update check failed:'
     Write-Host 'PASS: helper process creation failure uses the same actionable notification and diagnostic log'
+
+    # Remove the entire owned ProgID, leaving no synthetic test handler. The
+    # default-reader case above must pass before exercising genuine absence.
+    [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($progIdPath, $false)
+    [UpdateLogNative]::SHChangeNotify(0x08000000, 0x1000, [IntPtr]::Zero, [IntPtr]::Zero)
+    # HRESULT_FROM_WIN32(ERROR_NO_ASSOCIATION), not a null executable query:
+    # valid packaged/COM associations need not expose ASSOCSTR_EXECUTABLE.
+    Wait-For { [UpdateLogNative]::LogAssociationResult() -eq -2147023741 } 'explicit HRESULT 0x80070483 for no .log association'
+    Invoke-TrayMenu 1005 'Open update log'
+    $systemNotepad = Join-Path ([Environment]::GetFolderPath('System')) 'notepad.exe'
+    Wait-For {
+        $script:fallbacks = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($process.Id)" | Where-Object {
+            $_.ExecutablePath -ieq $systemNotepad -and $_.CommandLine
+        })
+        $script:fallbacks.Count -eq 1
+    } 'the actual Windows system Notepad child'
+    $fallback = $script:fallbacks[0]
+    $notepad = Get-Process -Id $fallback.ProcessId
+    $arguments = [UpdateLogNative]::Arguments($fallback.CommandLine)
+    if ($arguments.Length -ne 2 -or $arguments[1] -cne $logPath) {
+        throw 'The installed Notepad did not receive exactly the updater log path'
+    }
+    Wait-For { $notepad.Refresh(); $notepad.MainWindowHandle -ne [IntPtr]::Zero } 'the actual Notepad window'
+    $null = [UpdateLogNative]::PostMessage($notepad.MainWindowHandle, 0x0010, [UIntPtr]::Zero, [IntPtr]::Zero)
+    if (-not $notepad.WaitForExit(5000)) { throw 'The owned Notepad window did not close' }
+    Assert-NoExtraOpen 3
+    Write-Host 'PASS: an explicitly absent .log association opens the installed system Notepad with the exact document argument'
 } finally {
     $env:LOCALAPPDATA = $originalLocalAppData
     $env:SystemRoot = $originalSystemRoot
-    if ($null -ne $process) {
-        if (-not $process.HasExited) { $process.Kill(); $null = $process.WaitForExit(10000) }
-        $process.Dispose()
+    $cleanupErrors = [Collections.Generic.List[string]]::new()
+    function Invoke-UpdateLogCleanup([scriptblock]$action) {
+        try { & $action } catch { $cleanupErrors.Add($_.Exception.Message) }
+    }
+    # An already-exiting process or a settings cleanup error must never prevent
+    # restoration of the file association. Report all cleanup failures afterwards.
+    foreach ($owned in @($notepad, $process)) {
+        if ($null -ne $owned) {
+            Invoke-UpdateLogCleanup {
+                try {
+                    if (-not $owned.HasExited) {
+                        $owned.Kill()
+                        if (-not $owned.WaitForExit(10000)) { throw "Owned process $($owned.Id) did not exit" }
+                    }
+                } finally { $owned.Dispose() }
+            }
+        }
     }
     if ($null -ne $config) {
         foreach ($name in $savedConfig.Keys) {
             $saved = $savedConfig[$name]
-            if ($null -eq $saved) { $config.DeleteValue($name, $false) }
-            else { $config.SetValue($name, $saved.Value, $saved.Kind) }
+            Invoke-UpdateLogCleanup {
+                if ($null -eq $saved) { $config.DeleteValue($name, $false) }
+                else { $config.SetValue($name, $saved.Value, $saved.Kind) }
+            }
         }
-        $removeConfig = -not $configExisted -and $config.ValueCount -eq 0 -and $config.SubKeyCount -eq 0
-        $config.Dispose()
-        if ($removeConfig) { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($configPath, $false) }
+        Invoke-UpdateLogCleanup {
+            $removeConfig = -not $configExisted -and $config.ValueCount -eq 0 -and $config.SubKeyCount -eq 0
+            $config.Dispose()
+            if ($removeConfig) { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($configPath, $false) }
+        }
     }
-    if ($associationChanged) {
-        if ($hadDefault) { $extension.SetValue('', $oldDefault, $oldKind) }
-        else { $extension.DeleteValue('', $false) }
+    Invoke-UpdateLogCleanup {
+        if ($associationChanged) {
+            if ($hadDefault) { $extension.SetValue('', $oldDefault, $oldKind) }
+            else { $extension.DeleteValue('', $false) }
+        }
     }
-    if ($null -ne $extension) {
-        $removeExtension = -not $extensionExisted -and $extension.ValueCount -eq 0 -and $extension.SubKeyCount -eq 0
-        $extension.Dispose()
-        if ($removeExtension) { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($extensionPath, $false) }
+    Invoke-UpdateLogCleanup {
+        if ($null -ne $extension) {
+            $removeExtension = -not $extensionExisted -and $extension.ValueCount -eq 0 -and $extension.SubKeyCount -eq 0
+            $extension.Dispose()
+            if ($removeExtension) { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($extensionPath, $false) }
+        }
     }
-    [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($progIdPath, $false)
-    [UpdateLogNative]::SHChangeNotify(0x08000000, 0x1000, [IntPtr]::Zero, [IntPtr]::Zero)
-    if (Test-Path -LiteralPath $runtimeLog) { Get-Content -LiteralPath $runtimeLog -Tail 12 | ForEach-Object { Write-Host $_.Substring(0, [Math]::Min($_.Length, 250)) } }
-    if (Test-Path -LiteralPath $install) { Remove-Item -LiteralPath $install -Recurse -Force }
+    Invoke-UpdateLogCleanup { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($progIdPath, $false) }
+    Invoke-UpdateLogCleanup { [UpdateLogNative]::SHChangeNotify(0x08000000, 0x1000, [IntPtr]::Zero, [IntPtr]::Zero) }
+    Invoke-UpdateLogCleanup {
+        if (Test-Path -LiteralPath $runtimeLog) { Get-Content -LiteralPath $runtimeLog -Tail 12 | ForEach-Object { Write-Host $_.Substring(0, [Math]::Min($_.Length, 250)) } }
+    }
+    Invoke-UpdateLogCleanup { if (Test-Path -LiteralPath $install) { Remove-Item -LiteralPath $install -Recurse -Force } }
+    if ($cleanupErrors.Count -gt 0) { throw "Update-log fixture cleanup failed: $($cleanupErrors -join '; ')" }
 }

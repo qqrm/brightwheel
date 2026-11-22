@@ -4,9 +4,11 @@
 //! shutdown, so the running GUI never needs to overwrite its own executable.
 
 use std::{
+    ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     mem,
+    os::windows::ffi::OsStringExt,
     os::windows::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -20,8 +22,10 @@ use windows_sys::Win32::Foundation::{ERROR_NO_ASSOCIATION, HWND};
 use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
 };
+use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::UI::Shell::{
-    SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW,
+    ASSOCF_INIT_IGNOREUNKNOWN, ASSOCSTR_PROGID, AssocQueryStringW, SEE_MASK_FLAG_NO_UI,
+    SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, SW_SHOWNORMAL};
 
@@ -188,6 +192,30 @@ fn open_log_file(path: &Path) -> io::Result<()> {
     drop(file);
 
     let _apartment = ShellApartment::initialize()?;
+    let extension = platform::wide(".log");
+    let mut prog_id = [0_u16; 256];
+    let mut characters = prog_id.len() as u32;
+    // SAFETY: the extension is null-terminated and the output buffer/length
+    // remain writable through the call. IGNOREUNKNOWN excludes Open With's
+    // synthetic association, which ShellExecute can otherwise launch as a
+    // successful default action even with FLAG_NO_UI. Query the ProgID rather
+    // than an executable: valid packaged/COM handlers need not have one.
+    let association = unsafe {
+        AssocQueryStringW(
+            ASSOCF_INIT_IGNOREUNKNOWN,
+            ASSOCSTR_PROGID,
+            extension.as_ptr(),
+            ptr::null(),
+            prog_id.as_mut_ptr(),
+            &mut characters,
+        )
+    };
+    let no_association = (0x8007_0000_u32 | ERROR_NO_ASSOCIATION) as i32;
+    if association == no_association {
+        return open_with_notepad(path);
+    }
+    // All other query results, including errors, defer to normal shell
+    // activation so a configured default/packaged handler is not bypassed.
     let document = platform::wide(path);
     let mut execute = SHELLEXECUTEINFOW {
         cbSize: mem::size_of::<SHELLEXECUTEINFOW>() as u32,
@@ -210,7 +238,24 @@ fn open_log_file(path: &Path) -> io::Result<()> {
 
     // Only the absence of an association selects Notepad. Broken or denied
     // user-configured editors remain visible errors instead of being bypassed.
-    let notepad = system_root()?.join(r"System32\notepad.exe");
+    open_with_notepad(path)
+}
+
+fn open_with_notepad(path: &Path) -> io::Result<()> {
+    let mut directory = vec![0_u16; 32_768];
+    // SAFETY: `directory` is a writable UTF-16 buffer of the supplied capacity.
+    // Use the real Windows system directory, independent of environment/PATH.
+    let length = unsafe { GetSystemDirectoryW(directory.as_mut_ptr(), directory.len() as u32) };
+    if length == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if length as usize >= directory.len() {
+        return Err(io::Error::other(
+            "Windows system directory path is too long",
+        ));
+    }
+    let notepad =
+        PathBuf::from(OsString::from_wide(&directory[..length as usize])).join("notepad.exe");
     Command::new(notepad).arg(path).spawn()?;
     Ok(())
 }
