@@ -243,8 +243,11 @@ python -m unittest discover -s scripts/e2e -p test_winget_test_source.py -v
 
 Before invoking WinGet, both jobs also compile and run
 `scripts/e2e/inno-array-probe.ps1`. Its required controls check native process
-queries and ownership of a live process handle in a fixed buffer. Dynamic-array
-handoffs are recorded as diagnostic observations, including any mismatches.
+queries, ownership of a live process handle in a fixed buffer, and token-based
+child launch with the installer's explicit `0x18B` handle access mask. The token
+controls verify that logon identity, elevation, and session are preserved.
+Dynamic-array handoffs and smaller token access masks are recorded as diagnostic
+observations, including any mismatches.
 The probe's `result.json` and `setup.log` are preserved with the Windows package
 test artifacts; a required control failure blocks the WinGet scenarios.
 
