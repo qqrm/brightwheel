@@ -32,6 +32,28 @@ Download `brightwheel.exe` from the
 The executable is self-contained, but unsigned releases may trigger a Windows
 SmartScreen warning on first launch.
 
+### WinGet and UniGetUI installer support
+
+The next installer release adds `brightwheel-setup.exe`, a per-user installer
+for Windows 10/11. It updates a running copy, waits for the old process to exit,
+and starts the replacement only when the application was running before the
+upgrade. A stopped application stays stopped during a silent installation.
+Autostart and automatic-update preferences are preserved.
+
+For existing `QQRM.BrightWheel` WinGet portable installations, the installer
+validates WinGet's per-user registration and upgrades the executable in the same
+directory. This keeps the existing command alias and autostart path valid. The
+portable registration is retired only after installation and any required
+restart succeed. Fresh installations use `%LOCALAPPDATA%\Programs\BrightWheel`
+and a Start menu shortcut. Machine-wide portable installations are outside this
+per-user migration path.
+
+This support reaches UniGetUI when a release containing the installer is
+published **and its installer manifest is accepted in
+[microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs/tree/master/manifests/q/QQRM/BrightWheel)**.
+The current `0.1.9` catalog entry still distributes a portable executable and
+does not gain these behaviors from a source change alone.
+
 ### Updating without manually exiting
 
 BrightWheel checks for updates in the background on every normal launch by
@@ -51,6 +73,12 @@ A detached PowerShell helper then asks the running tray process to exit,
 replaces `brightwheel.exe` (and the optional co-located `bright.exe` CLI),
 and restarts the tray. The previous executables are preserved for rollback
 if replacement or restart fails.
+
+For copies owned by the new installer, the same helper instead verifies and
+runs `brightwheel-setup.exe`. This also updates the installed version shown to
+WinGet and UniGetUI. Installer failures are reported without falling back to
+raw executable replacement. Standalone and Cargo installations retain the
+portable update path described above.
 
 The updater requires Windows PowerShell 5.1, HTTPS access to GitHub, and
 write access to the installation directory. Automatic startup checks do not show
@@ -119,6 +147,53 @@ cargo test --all-targets --locked
 
 Hardware-independent behavior is covered by automated tests. DDC/CI and HDR
 still require manual testing with a compatible monitor.
+
+### Windows installation acceptance tests
+
+The Windows CI job and release gate exercise the shipped executable and
+installer:
+
+- first launch creates the real per-user Run entry; its exact quoted command
+  starts the app from a path containing spaces;
+- the actual tray menu disables and re-enables autostart, and the choice
+  survives subsequent launches;
+- the real WinGet client installs the published `0.1.9` portable package, then
+  upgrades the running application using a generated installer manifest;
+- subsequent installer upgrades preserve running/stopped state, the autostart
+  choice, the installed path, and user settings;
+- installed payload hashes, process replacement, tray readiness, and the
+  installed version are checked together;
+- a failed or unverified update must preserve or restore the working version;
+- the built-in updater is exercised with an actual local installer and a
+  fixture for GitHub transport, including rejection of a mismatching SHA-256.
+
+Installer tests use explicitly synthetic package versions such as `999.0.1` to
+exercise multiple upgrades before a public release exists. They run only on
+disposable GitHub-hosted Windows runners. They do not replace a real sign-in
+test or hardware-dependent DDC/CI, HDR, and suspend/resume checks.
+
+### Packaging and WinGet publication
+
+In a Windows shell with Inno Setup 6 installed:
+
+```powershell
+cargo build --release --locked
+./scripts/package-windows.ps1
+winget validate --manifest target/dist/winget
+```
+
+The package script emits the installer, portable executables and ZIP,
+`SHA256SUMS.txt`, and three WinGet manifests under `target/dist/winget`. The
+release workflow publishes these manifests as
+`brightwheel-winget-manifests.zip`, with the installer URL and SHA-256 taken
+from the actual release build. Prerelease tags retain the portable-only release
+format and do not produce a stable installer or WinGet manifests.
+
+After publishing a new version, submit the three generated YAML files under
+`manifests/q/QQRM/BrightWheel/<version>/` in `microsoft/winget-pkgs`. Keep the
+portable `AppsAndFeaturesEntries` identity in the installer manifest: WinGet
+needs it to select the new installer for users upgrading the existing portable
+package. Uploading the release alone does not update the WinGet catalog.
 
 ## License
 

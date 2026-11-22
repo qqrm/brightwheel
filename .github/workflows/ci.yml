@@ -37,15 +37,17 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Validate updater PowerShell syntax
+      - name: Validate PowerShell syntax
         shell: pwsh
         run: |
-          $tokens = $null
-          $errors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile(
-            (Resolve-Path scripts/windows-updater.ps1), [ref]$tokens, [ref]$errors
-          ) | Out-Null
-          if ($errors) { throw ($errors | Out-String) }
+          Get-ChildItem scripts -Recurse -Filter '*.ps1' | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName, [ref]$tokens, [ref]$errors
+            ) | Out-Null
+            if ($errors) { throw ($errors | Out-String) }
+          }
 
       - name: Run Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
@@ -68,7 +70,7 @@ jobs:
   updater-live:
     name: Live updater E2E
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - name: Checkout source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -85,12 +87,39 @@ jobs:
       - name: Verify application identity
         shell: pwsh
         run: ./scripts/e2e/application-identity.ps1
+      - name: Autostart registration and tray preferences
+        shell: powershell
+        run: ./scripts/e2e/autostart.ps1
       - name: Automatic update startup preferences
         shell: pwsh
         run: ./scripts/e2e/startup-updates.ps1
+      - name: Package the installer test fixture
+        shell: pwsh
+        run: ./scripts/package-windows.ps1 -Version 999.0.1 -OutputDirectory target/package-e2e
+      - name: Real WinGet upgrades and installer-managed updates
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          ./scripts/e2e/winget-upgrade.ps1
+          -Application brightwheel
+          -InstallerPath target/package-e2e/brightwheel-setup.exe
+          -ExecutablePath target/release/brightwheel.exe
+          -LegacyVersion 0.1.9
+          -PackageVersion 999.0.1
+          -ManifestDirectory target/package-e2e/winget
+          -BuildScriptPath scripts/package-windows.ps1
       - name: Live upgrade and no-op behavior
         shell: pwsh
         run: ./scripts/e2e/updater-live.ps1 -Application brightwheel
+      - name: Preserve Windows package test diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: windows-package-e2e
+          path: ${{ runner.temp }}/winget-upgrade-brightwheel
+          if-no-files-found: ignore
+          retention-days: 7
 
   dependency-security:
     name: Dependency security

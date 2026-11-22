@@ -33,6 +33,25 @@ $logPath = Join-Path $install 'updater.log'
 $target = Join-Path $install $binary
 $process = $null
 $windowsPowerShell = Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'
+$config = $null
+$runKey = $null
+$savedRegistry = @{}
+if ($optionalCli) {
+    $configPath = 'Software\BrightWheel'
+    $config = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($configPath, $true)
+    $configExisted = $null -ne $config
+    if (-not $configExisted) { $config = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($configPath) }
+    $runKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Software\Microsoft\Windows\CurrentVersion\Run')
+    foreach ($name in @('AutoStartConfigured', 'AutoUpdateEnabled', 'BrightWheel')) {
+        $key = if ($name -eq 'BrightWheel') { $runKey } else { $config }
+        $savedRegistry[$name] = if ($key.GetValueNames() -contains $name) {
+            @{
+                Value = $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                Kind = $key.GetValueKind($name)
+            }
+        } else { $null }
+    }
+}
 
 New-Item -ItemType Directory -Force -Path $install | Out-Null
 Copy-Item -LiteralPath $source -Destination $target
@@ -78,6 +97,12 @@ function Assert-RestartSkipsCheck([int]$processId) {
 }
 
 try {
+    if ($optionalCli) {
+        # The temporary updater fixture must never become the user's sign-in
+        # executable. Dedicated autostart E2E covers real registration changes.
+        $config.SetValue('AutoStartConfigured', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+        $config.SetValue('AutoUpdateEnabled', 0, [Microsoft.Win32.RegistryValueKind]::DWord)
+    }
     $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repository/releases/latest" -Headers @{'User-Agent'='Windows-Updater-E2E'} -TimeoutSec 40
     Write-Host "Testing $Application against real release $($release.tag_name)"
     $start = @{ FilePath = $target; WorkingDirectory = $install; PassThru = $true }
@@ -179,5 +204,17 @@ try {
     }
     if (Test-Path -LiteralPath $logPath) {
         Get-Content -LiteralPath $logPath | ForEach-Object { Write-Host $_ }
+    }
+    if ($optionalCli) {
+        foreach ($name in $savedRegistry.Keys) {
+            $key = if ($name -eq 'BrightWheel') { $runKey } else { $config }
+            $saved = $savedRegistry[$name]
+            if ($null -eq $saved) { $key.DeleteValue($name, $false) }
+            else { $key.SetValue($name, $saved.Value, $saved.Kind) }
+        }
+        $runKey.Dispose()
+        $removeConfig = -not $configExisted -and $config.ValueCount -eq 0 -and $config.SubKeyCount -eq 0
+        $config.Dispose()
+        if ($removeConfig) { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($configPath, $false) }
     }
 }
