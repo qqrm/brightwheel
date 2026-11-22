@@ -116,6 +116,10 @@ public static class PackageAcceptanceNative {
         public bool Visible { get; set; }
         public bool Enabled { get; set; }
         public bool TextResponsive { get; set; }
+        public string OwnerHandle { get; set; }
+        public string EnabledPopupHandle { get; set; }
+        public string LastActivePopupHandle { get; set; }
+        public string[] OwnerChain { get; set; }
     }
     public sealed class TokenSnapshot {
         public string UserSid { get; set; }
@@ -154,6 +158,18 @@ public static class PackageAcceptanceNative {
     private static extern bool IsWindowVisible(IntPtr window);
     [DllImport("user32.dll")]
     private static extern bool IsWindowEnabled(IntPtr window);
+    [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr window, uint command);
+    [DllImport("user32.dll")] private static extern IntPtr GetLastActivePopup(IntPtr window);
+    [DllImport("user32.dll")] private static extern int GetSystemMetrics(int index);
+    [DllImport("kernel32.dll")] private static extern bool ProcessIdToSessionId(uint processId, out uint sessionId);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    private static extern IntPtr LoadLibraryEx(string file, IntPtr reserved, uint flags);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    private static extern IntPtr FindResource(IntPtr module, IntPtr name, IntPtr type);
+    [DllImport("kernel32.dll", SetLastError=true)] private static extern uint SizeofResource(IntPtr module, IntPtr resource);
+    [DllImport("kernel32.dll", SetLastError=true)] private static extern IntPtr LoadResource(IntPtr module, IntPtr resource);
+    [DllImport("kernel32.dll")] private static extern IntPtr LockResource(IntPtr resource);
+    [DllImport("kernel32.dll")] private static extern bool FreeLibrary(IntPtr module);
     [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", CharSet=CharSet.Unicode, ExactSpelling=true)]
     private static extern IntPtr ReadWindowText(IntPtr window, uint message, UIntPtr capacity,
         StringBuilder text, uint flags, uint timeout, out UIntPtr result);
@@ -313,6 +329,67 @@ public static class PackageAcceptanceNative {
         }, IntPtr.Zero);
         return windows.ToArray();
     }
+    public static WindowSnapshot[] DescribeVisibleSessionWindows(int sessionId) {
+        var windows = new List<WindowSnapshot>();
+        var elapsed = Stopwatch.StartNew();
+        Func<IntPtr, IntPtr, bool> capture = delegate(IntPtr window, IntPtr topLevel) {
+            if (elapsed.ElapsedMilliseconds >= 3000 || windows.Count >= 100) return false;
+            if (!IsWindowVisible(window)) return true;
+            uint processId, windowSession;
+            GetWindowThreadProcessId(window, out processId);
+            if (!ProcessIdToSessionId(processId, out windowSession) || windowSession != (uint)sessionId) return true;
+            var className = new StringBuilder(256);
+            GetClassName(window, className, className.Capacity);
+            var text = new StringBuilder(2048);
+            UIntPtr result;
+            bool responsive = ReadWindowText(window, 0x000D, new UIntPtr((uint)text.Capacity),
+                text, 2, 100, out result) != IntPtr.Zero;
+            var chain = new List<string>();
+            var seen = new HashSet<IntPtr>();
+            var owner = GetWindow(window, 4); // GW_OWNER, which can cross process boundaries.
+            for (var current = owner; current != IntPtr.Zero && chain.Count < 12 && seen.Add(current); current = GetWindow(current, 4)) {
+                uint ownerProcess;
+                GetWindowThreadProcessId(current, out ownerProcess);
+                chain.Add("0x" + current.ToInt64().ToString("x") + " pid=" + ownerProcess);
+            }
+            windows.Add(new WindowSnapshot { ProcessId = checked((int)processId),
+                Handle = "0x" + window.ToInt64().ToString("x"),
+                TopLevelHandle = "0x" + topLevel.ToInt64().ToString("x"),
+                ClassName = className.ToString(), Text = text.ToString(),
+                Visible = true, Enabled = IsWindowEnabled(window), TextResponsive = responsive,
+                OwnerHandle = "0x" + owner.ToInt64().ToString("x"), OwnerChain = chain.ToArray(),
+                EnabledPopupHandle = "0x" + GetWindow(window, 6).ToInt64().ToString("x"),
+                LastActivePopupHandle = "0x" + GetLastActivePopup(window).ToInt64().ToString("x") });
+            return true;
+        };
+        EnumWindows(delegate(IntPtr window, IntPtr parameter) {
+            if (!capture(window, window)) return false;
+            if (IsWindowVisible(window))
+                EnumChildWindows(window, delegate(IntPtr child, IntPtr ignored) { return capture(child, window); }, IntPtr.Zero);
+            return true;
+        }, IntPtr.Zero);
+        return windows.ToArray();
+    }
+    public static int[] DesktopBounds() {
+        return new int[] { GetSystemMetrics(76), GetSystemMetrics(77), GetSystemMetrics(78), GetSystemMetrics(79) };
+    }
+    public static string ReadEmbeddedManifest(string path) {
+        // Map resource data only: do not execute the installer or resolve imports.
+        var module = LoadLibraryEx(path, IntPtr.Zero, 0x0040 | 0x0020);
+        if (module == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+        try {
+            var resource = FindResource(module, new IntPtr(1), new IntPtr(24)); // RT_MANIFEST / CREATEPROCESS_MANIFEST_RESOURCE_ID
+            if (resource == IntPtr.Zero) return null;
+            uint size = SizeofResource(module, resource);
+            if (size == 0 || size > 1024 * 1024) throw new InvalidOperationException("Unexpected PE manifest size.");
+            var address = LockResource(LoadResource(module, resource));
+            if (address == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+            var bytes = new byte[(int)size];
+            Marshal.Copy(address, bytes, 0, bytes.Length);
+            var encoding = bytes.Length >= 2 && bytes[0] == 0xff && bytes[1] == 0xfe ? Encoding.Unicode : Encoding.UTF8;
+            return encoding.GetString(bytes).TrimStart('\uFEFF').TrimEnd('\0');
+        } finally { FreeLibrary(module); }
+    }
     public static Process StartStoredCommand(string command, string directory, IntPtr token) {
         var startup = new StartupInfo { size = (uint)Marshal.SizeOf<StartupInfo>() };
         ProcessInformation created;
@@ -380,9 +457,105 @@ function Read-Arp([string]$Code) {
         return $result
     } finally { if ($null -ne $key) { $key.Dispose() }; $base.Dispose() }
 }
-function Save-OwnedProcessDiagnostics([Diagnostics.Process]$RootProcess, [string]$Destination) {
+function Read-InstallerSignature([string]$Path) {
+    # Certificate verification can consult providers. Bound this read-only probe
+    # in its own process so diagnostics cannot delay cleanup indefinitely.
+    $scriptText = @'
+$signature = Get-AuthenticodeSignature -LiteralPath '__INSTALLER_PATH__' -ErrorAction Stop
+[ordered]@{
+    Status = [string]$signature.Status
+    StatusMessage = $signature.StatusMessage
+    SignatureType = [string]$signature.SignatureType
+    SignerSubject = $(if ($null -ne $signature.SignerCertificate) { $signature.SignerCertificate.Subject })
+    SignerThumbprint = $(if ($null -ne $signature.SignerCertificate) { $signature.SignerCertificate.Thumbprint })
+} | ConvertTo-Json -Compress
+'@
+    $scriptText = $scriptText.Replace('__INSTALLER_PATH__', $Path.Replace("'", "''"))
+    $info = [Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh.exe'))
+    $info.UseShellExecute = $false; $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+    foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand',
+        [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($scriptText)))) { $info.ArgumentList.Add($argument) }
+    $process = [Diagnostics.Process]::Start($info)
+    try {
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(5000)) {
+            $process.Kill($true); $null = $process.WaitForExit(2000)
+            throw 'Authenticode inspection exceeded five seconds.'
+        }
+        if ($process.ExitCode -ne 0) { throw $stderr.GetAwaiter().GetResult() }
+        return $stdout.GetAwaiter().GetResult() | ConvertFrom-Json
+    } finally { $process.Dispose() }
+}
+function Get-StagedInstallerEvidence([string]$ManifestPath, [DateTime]$StartedUtc, [string]$Destination) {
+    $evidence = [ordered]@{ Path = $null; ExpectedSha256 = $null; ActualSha256 = $null; Size = $null;
+        HashMatches = $false; ZoneIdentifier = $null; Authenticode = $null; EmbeddedManifest = $null;
+        PreservedInstaller = $null; Error = $null; ZoneError = $null; SignatureError = $null; ManifestError = $null }
+    try {
+        if (-not [IO.Path]::GetFullPath($ManifestPath).StartsWith($work + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'The diagnostic manifest is outside the owned fixture directory.'
+        }
+        $files = @(Get-ChildItem -LiteralPath $ManifestPath -Filter '*.installer.yaml' -File)
+        if ($files.Count -ne 1) { throw 'Expected exactly one fixture installer manifest.' }
+        $yaml = [IO.File]::ReadAllText($files[0].FullName)
+        $fields = @{}
+        foreach ($name in @('PackageIdentifier', 'PackageVersion', 'InstallerUrl', 'InstallerSha256')) {
+            $values = [regex]::Matches($yaml, '(?m)^\s*' + $name + ':\s*([^\r\n]+)\s*$')
+            if ($values.Count -ne 1) { throw "Expected exactly one $name in the fixture manifest." }
+            $fields[$name] = $values[0].Groups[1].Value.Trim().Trim([char[]]@('"', "'"))
+        }
+        if ($fields.PackageIdentifier -cne $packageId -or $fields.PackageVersion -notmatch '^\d+\.\d+\.\d+$' -or
+            $fields.InstallerSha256 -notmatch '^[a-fA-F0-9]{64}$') { throw 'Unexpected fixture manifest identity or hash.' }
+        $uri = [uri]$fields.InstallerUrl
+        if ($uri.Scheme -ne 'http' -or $uri.Host -ne '127.0.0.1') { throw 'Expected the owned loopback fixture URL.' }
+        $filename = [IO.Path]::GetFileNameWithoutExtension($uri.AbsolutePath) + '.exe'
+        if ($filename -notmatch '^[a-zA-Z0-9_.-]+\.exe$') { throw 'Unexpected fixture installer filename.' }
+        $directoryName = $fields.PackageIdentifier + '.' + $fields.PackageVersion
+        $paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($file in @(Get-ChildItem -LiteralPath $wingetLogDirectory -Filter '*.log' -File |
+            Where-Object { $_.LastWriteTimeUtc -ge $StartedUtc -and $_.Length -le 4MB } |
+            Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 8)) {
+            foreach ($match in [regex]::Matches([IO.File]::ReadAllText($file.FullName), "Starting: '([^']+)' with arguments")) {
+                $path = $match.Groups[1].Value
+                if ([IO.Path]::GetFileName($path) -ceq $filename -and
+                    [IO.Path]::GetFileName([IO.Path]::GetDirectoryName($path)) -ceq $directoryName) { $null = $paths.Add($path) }
+            }
+        }
+        if ($paths.Count -ne 1) { throw 'Could not identify one exact staged fixture installer from the new WinGet trace.' }
+        $path = @($paths)[0]
+        $evidence.Path = $path
+        $evidence.ExpectedSha256 = $fields.InstallerSha256
+        $evidence.Size = (Get-Item -LiteralPath $path).Length
+        if ($evidence.Size -gt 128MB) { throw 'Staged installer exceeds the bounded diagnostic artifact size.' }
+        $evidence.ActualSha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+        $evidence.HashMatches = $evidence.ActualSha256 -ieq $evidence.ExpectedSha256
+        if (-not $evidence.HashMatches) { throw 'Refusing to preserve an installer whose hash differs from the fixture manifest.' }
+        $preserved = [IO.Path]::ChangeExtension($Destination, '.setup.exe')
+        Copy-Item -LiteralPath $path -Destination $preserved
+        $evidence.PreservedInstaller = $preserved
+        try {
+            if ($null -ne (Get-Item -LiteralPath $path -Stream Zone.Identifier -ErrorAction SilentlyContinue)) {
+                $evidence.ZoneIdentifier = Get-Content -LiteralPath $path -Stream Zone.Identifier -Raw
+            }
+        } catch { $evidence.ZoneError = $_.Exception.Message }
+        try { $evidence.Authenticode = Read-InstallerSignature $path }
+        catch { $evidence.SignatureError = $_.Exception.Message }
+        try {
+            $manifest = [PackageAcceptanceNative]::ReadEmbeddedManifest($path)
+            if ($null -ne $manifest) {
+                $manifestPath = [IO.Path]::ChangeExtension($Destination, '.manifest.xml')
+                [IO.File]::WriteAllText($manifestPath, $manifest)
+                $evidence.EmbeddedManifest = $manifestPath
+            }
+        } catch { $evidence.ManifestError = $_.Exception.Message }
+    } catch { $evidence.Error = $_.Exception.ToString() }
+    return $evidence
+}
+function Save-OwnedProcessDiagnostics([Diagnostics.Process]$RootProcess, [string]$Destination, [string]$InstallerManifestPath) {
     $diagnostic = [ordered]@{ RootProcessId = $RootProcess.Id; CapturedUtc = [DateTime]::UtcNow;
-        Processes = @(); Windows = @(); Error = $null }
+        Processes = @(); Windows = @(); Error = $null; SessionId = $null; VisibleSessionWindows = @();
+        ShellProcesses = @(); SessionError = $null; Screenshot = $null; ScreenshotError = $null; StagedInstaller = $null }
     try {
         # Inventory only parent/PID/creation metadata first. Command lines are
         # fetched only for the root we started and its verified descendants.
@@ -412,6 +585,43 @@ function Save-OwnedProcessDiagnostics([Diagnostics.Process]$RootProcess, [string
         $diagnostic.Processes = $details
         if ($details.Count) { $diagnostic.Windows = [PackageAcceptanceNative]::DescribeOwnedWindows([int[]]@($details.ProcessId)) }
     } catch { $diagnostic.Error = $_.Exception.ToString() }
+    try {
+        # Broker dialogs may live outside the process tree. Broader desktop
+        # evidence is permitted only on this explicitly disposable test VM.
+        if (-not $IsWindows -or $env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or
+            $env:RUNNER_OS -ne 'Windows' -or -not [Environment]::UserInteractive) {
+            throw 'Session diagnostics require the disposable interactive GitHub-hosted Windows runner.'
+        }
+        $sessionId = (Get-Process -Id $PID).SessionId
+        if ($sessionId -eq 0 -or $RootProcess.SessionId -ne $sessionId) { throw 'The WinGet process is not in the current interactive session.' }
+        $diagnostic.SessionId = $sessionId
+        $diagnostic.VisibleSessionWindows = [PackageAcceptanceNative]::DescribeVisibleSessionWindows($sessionId)
+        $names = @('smartscreen.exe', 'explorer.exe', 'consent.exe', 'dllhost.exe', 'RuntimeBroker.exe',
+            'ApplicationFrameHost.exe', 'OpenWith.exe', 'sihost.exe', 'SecurityHealthSystray.exe')
+        $filter = "SessionId=$sessionId AND (" + (($names | ForEach-Object { "Name='$_'" }) -join ' OR ') + ')'
+        $brokerProperties = @('ProcessId', 'ParentProcessId', 'Name', 'ExecutablePath', 'CreationDate', 'SessionId')
+        $diagnostic.ShellProcesses = @(Get-CimInstance -ClassName Win32_Process -Filter $filter -Property $brokerProperties -OperationTimeoutSec 2 |
+            Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CreationDate, SessionId)
+        try {
+            Add-Type -AssemblyName System.Drawing
+            $bounds = [PackageAcceptanceNative]::DesktopBounds()
+            if ($bounds[2] -le 0 -or $bounds[3] -le 0 -or [long]$bounds[2] * $bounds[3] -gt 16000000) {
+                throw 'The interactive desktop dimensions exceed the screenshot limit.'
+            }
+            $bitmap = [Drawing.Bitmap]::new($bounds[2], $bounds[3])
+            try {
+                $graphics = [Drawing.Graphics]::FromImage($bitmap)
+                try { $graphics.CopyFromScreen($bounds[0], $bounds[1], 0, 0, $bitmap.Size) }
+                finally { $graphics.Dispose() }
+                $screenshotPath = [IO.Path]::ChangeExtension($Destination, '.desktop.png')
+                $bitmap.Save($screenshotPath, [Drawing.Imaging.ImageFormat]::Png)
+                $diagnostic.Screenshot = $screenshotPath
+            } finally { $bitmap.Dispose() }
+        } catch { $diagnostic.ScreenshotError = $_.Exception.ToString() }
+    } catch { $diagnostic.SessionError = $_.Exception.ToString() }
+    if ($InstallerManifestPath) {
+        $diagnostic.StagedInstaller = Get-StagedInstallerEvidence $InstallerManifestPath $RootProcess.StartTime.ToUniversalTime() $Destination
+    }
     $diagnostic | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Destination -Encoding utf8
 }
 function Invoke-Logged([string]$File, [string[]]$Arguments, [string]$Label, [int]$TimeoutSeconds = 180) {
@@ -442,7 +652,9 @@ function Invoke-Logged([string]$File, [string[]]$Arguments, [string]$Label, [int
                 $timedOut = $true
                 if ($winget -and [string]::Equals($File, $winget, [StringComparison]::OrdinalIgnoreCase)) {
                     $diagnosticsPath = "$prefix-timeout.json"
-                    try { Save-OwnedProcessDiagnostics $process $diagnosticsPath }
+                    $manifestIndex = [Array]::IndexOf($Arguments, '--manifest')
+                    $diagnosticManifest = if ($manifestIndex -ge 0 -and $manifestIndex + 1 -lt $Arguments.Length) { $Arguments[$manifestIndex + 1] } else { $null }
+                    try { Save-OwnedProcessDiagnostics $process $diagnosticsPath $diagnosticManifest }
                     catch { $captureError = 'Timeout diagnostics failed: ' + $_.Exception.ToString() }
                 }
                 if (-not $process.HasExited) { $process.Kill($true) }
