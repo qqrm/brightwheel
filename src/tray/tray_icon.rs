@@ -55,7 +55,7 @@ pub(crate) fn application_icon() -> HICON {
     }
 }
 
-pub(crate) fn add(window: HWND, icon: HICON, status: Status) -> io::Result<()> {
+pub(crate) fn restore(window: HWND, icon: HICON, status: Status) -> io::Result<()> {
     let dynamic_icon = BrightnessIcon::create(icon, status.brightness).ok();
     let mut data = data(window);
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
@@ -64,7 +64,12 @@ pub(crate) fn add(window: HWND, icon: HICON, status: Status) -> io::Result<()> {
     set_tooltip(&mut data.szTip, status);
 
     // SAFETY: `data` is initialized with its exact ABI size and valid handles.
-    if unsafe { Shell_NotifyIconW(NIM_ADD, &data) } == 0 {
+    // Repeated shell/resume notifications are idempotent. A missing icon needs
+    // NIM_ADD; an existing one needs all fields refreshed through NIM_MODIFY.
+    if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) } == 0
+        // SAFETY: the same complete initialized record can register a missing icon.
+        && unsafe { Shell_NotifyIconW(NIM_ADD, &data) } == 0
+    {
         return Err(io::Error::last_os_error());
     }
 
@@ -78,21 +83,6 @@ pub(crate) fn add(window: HWND, icon: HICON, status: Status) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
-}
-
-pub(crate) fn update(window: HWND, icon: HICON, status: Status) {
-    let dynamic_icon = BrightnessIcon::create(icon, status.brightness).ok();
-    let mut data = data(window);
-    data.uFlags = NIF_TIP | NIF_SHOWTIP;
-    if let Some(icon) = &dynamic_icon {
-        data.uFlags |= NIF_ICON;
-        data.hIcon = icon.handle();
-    }
-    set_tooltip(&mut data.szTip, status);
-    // SAFETY: `data` identifies the existing icon and contains a valid tooltip.
-    unsafe {
-        Shell_NotifyIconW(NIM_MODIFY, &data);
-    }
 }
 
 pub(crate) fn notify(window: HWND, title: &str, message: &str) {
