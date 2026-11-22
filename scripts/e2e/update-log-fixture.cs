@@ -13,6 +13,8 @@ internal static class UpdateLogFixture
         string directory = Path.GetDirectoryName(executable);
         if (Path.GetFileName(executable).Equals("powershell.exe", StringComparison.OrdinalIgnoreCase))
         {
+            File.AppendAllText(Path.Combine(directory, "helper-invocations.txt"),
+                DateTime.UtcNow.ToString("O") + " pid=" + System.Diagnostics.Process.GetCurrentProcess().Id + Environment.NewLine);
             int code = Int32.Parse(File.ReadAllText(Path.Combine(directory, "result-code.txt")));
             if (code != 0 && code != 10)
             {

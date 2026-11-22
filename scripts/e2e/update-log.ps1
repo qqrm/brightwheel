@@ -13,7 +13,8 @@ if (Get-Process -Name brightwheel -ErrorAction SilentlyContinue) {
     throw 'Update-log E2E requires no existing BrightWheel process.'
 }
 
-Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
 Add-Type -TypeDefinition @'
 using System;
 using System.Text;
@@ -46,6 +47,13 @@ public static class UpdateLogNative {
     public static extern IntPtr GetWindow(IntPtr window, uint command);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern int GetWindowText(IntPtr window, StringBuilder text, int capacity);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetClassName(IntPtr window, StringBuilder text, int capacity);
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr window);
+    private delegate bool EnumWindowsCallback(IntPtr window, IntPtr parameter);
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsCallback callback, IntPtr parameter);
     [DllImport("shell32.dll")]
     private static extern int Shell_NotifyIconGetRect(ref Identifier identifier, out Rect rect);
     [DllImport("shell32.dll")]
@@ -94,6 +102,22 @@ public static class UpdateLogNative {
         }
         return output.ToString();
     }
+    public static string[] OwnedWindows(uint processId) {
+        var output = new System.Collections.Generic.List<string>();
+        EnumWindows(delegate(IntPtr window, IntPtr parameter) {
+            uint owner;
+            GetWindowThreadProcessId(window, out owner);
+            if (owner != processId) return true;
+            var name = new StringBuilder(256);
+            var title = new StringBuilder(256);
+            GetClassName(window, name, name.Capacity);
+            GetWindowText(window, title, title.Capacity);
+            output.Add("hwnd=0x" + window.ToString("X") + "; class=" + name +
+                "; visible=" + IsWindowVisible(window) + "; title=" + title);
+            return output.Count < 8;
+        }, IntPtr.Zero);
+        return output.ToArray();
+    }
 }
 '@
 
@@ -108,6 +132,7 @@ $fakeSystemRoot = Join-Path $install 'fixture-windows'
 $helperDirectory = Join-Path $fakeSystemRoot 'System32\WindowsPowerShell\v1.0'
 $helper = Join-Path $helperDirectory 'powershell.exe'
 $helperResult = Join-Path $helperDirectory 'result-code.txt'
+$helperInvocations = Join-Path $helperDirectory 'helper-invocations.txt'
 $data = Join-Path $install 'local data'
 $logPath = Join-Path $data 'BrightWheel\updater.log'
 $runtimeLog = Join-Path $data 'BrightWheel\runtime.log'
@@ -122,7 +147,9 @@ $commandChanged = $false
 $createdCommandKeys = [Collections.Generic.List[string]]::new()
 $associationChanged = $false
 # ProgIDs must fit 39 characters; retain the complete random GUID for uniqueness.
-$missingProgId = "BWLog.$unique"
+$fallbackProgId = "BWLog.$unique"
+$fallbackClassPath = "Software\Classes\$fallbackProgId"
+$fallbackClassCreated = $false
 $extensionPath = 'Software\Classes\.log'
 $commandPath = 'Software\Classes\txtfile\shell\open\command'
 $configPath = 'Software\BrightWheel'
@@ -135,12 +162,35 @@ function Wait-For([scriptblock]$condition, [string]$description) {
         if ($null -ne $process -and $process.HasExited) { throw "BrightWheel exited while waiting for $description" }
         Start-Sleep -Milliseconds 100
     } while ([DateTime]::UtcNow -lt $deadline)
+    Write-TimeoutDiagnostics $description
     throw "Timed out waiting for $description"
 }
 
 function Read-Text([string]$path) {
     if (Test-Path -LiteralPath $path) { return [IO.File]::ReadAllText($path) }
     return ''
+}
+
+function Write-TimeoutDiagnostics([string]$description) {
+    # Collect only this fixture's process tree and short log tails, before its
+    # finally block destroys them. A diagnostic failure must preserve the test error.
+    Write-Host "Fixture timeout: $description"
+    try {
+        Write-Host "Effective .log association: ProgId='$([UpdateLogNative]::AssociatedProgId())'; reader='$([UpdateLogNative]::AssociatedExecutable())'; IGNOREUNKNOWN result=$([UpdateLogNative]::LogAssociationResult())"
+        if ($null -ne $process) {
+            $owned = @(Get-CimInstance Win32_Process -OperationTimeoutSec 5 -Filter "ProcessId=$($process.Id) OR ParentProcessId=$($process.Id)" | Select-Object -First 8)
+            foreach ($item in $owned) {
+                Write-Host "Owned process: pid=$($item.ProcessId); parent=$($item.ParentProcessId); executable=$($item.ExecutablePath)"
+                foreach ($window in [UpdateLogNative]::OwnedWindows([uint32]$item.ProcessId)) { Write-Host $window }
+            }
+        }
+        foreach ($path in @($helperInvocations, $runtimeLog, $logPath)) {
+            Write-Host "Fixture diagnostic tail: $path"
+            if (Test-Path -LiteralPath $path) {
+                Get-Content -LiteralPath $path -Tail 8 | ForEach-Object { Write-Host $_.Substring(0, [Math]::Min($_.Length, 400)) }
+            } else { Write-Host '<absent>' }
+        }
+    } catch { Write-Host "Could not collect fixture diagnostics: $($_.Exception.Message)" }
 }
 
 function Read-RegistryDefault([Microsoft.Win32.RegistryKey]$root, [string]$path) {
@@ -166,10 +216,9 @@ function Invoke-TrayMenu([uint32]$commandId, [string]$label) {
         $null = [UpdateLogNative]::GetWindowThreadProcessId($script:popup, [ref]$ownerPid)
         $script:popup -ne [IntPtr]::Zero -and $ownerPid -eq $process.Id
     } 'the production tray popup menu'
-    # MN_GETHMENU reads the real TrackPopupMenu menu. Use native keyboard input
-    # only after checking the command ID and visible label of the enabled item.
+    # MN_GETHMENU reads the real TrackPopupMenu menu. Invoke its actual UI
+    # Automation item only after checking the command ID and enabled label.
     $menu = [UpdateLogNative]::SendMessage($script:popup, 0x01e1, [UIntPtr]::Zero, [IntPtr]::Zero)
-    $selectableBefore = 0
     $found = $false
     for ($index = 0; $index -lt [UpdateLogNative]::GetMenuItemCount($menu); $index++) {
         $state = [UpdateLogNative]::GetMenuState($menu, [uint32]$index, 0x0400)
@@ -181,10 +230,20 @@ function Invoke-TrayMenu([uint32]$commandId, [string]$label) {
             $found = $true
             break
         }
-        $selectableBefore++
     }
     if (-not $found) { throw "Tray menu did not expose enabled '$label'" }
-    [Windows.Forms.SendKeys]::SendWait('{HOME}' + ('{DOWN}' * $selectableBefore) + '{ENTER}')
+    $popupElement = [System.Windows.Automation.AutomationElement]::FromHandle($script:popup)
+    $nameCondition = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::NameProperty, $label)
+    Wait-For {
+        $script:menuItem = $popupElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $nameCondition)
+        $null -ne $script:menuItem -and $script:menuItem.Current.ProcessId -eq $process.Id -and
+            $script:menuItem.Current.IsEnabled -and
+            $script:menuItem.Current.ControlType -eq [System.Windows.Automation.ControlType]::MenuItem
+    } "the owned UI Automation menu item '$label'"
+    $invoke = [System.Windows.Automation.InvokePattern]$script:menuItem.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+    Write-Host "Invoking owned tray menu: pid=$($process.Id); command=$commandId; label='$label'"
+    $invoke.Invoke()
     Wait-For { [UpdateLogNative]::FindWindow('#32768', $null) -eq [IntPtr]::Zero } 'menu selection'
 }
 
@@ -372,14 +431,27 @@ try {
     Assert-Opened 3 'Update check failed:'
     Write-Host 'PASS: helper process creation failure uses the same actionable notification and diagnostic log'
 
-    # The real default-reader case must pass first. An owned nonexistent ProgID
-    # then provides genuine absence, without changing UserChoice or txtfile.
-    $missingClass = [Microsoft.Win32.Registry]::ClassesRoot.OpenSubKey($missingProgId)
-    if ($null -ne $missingClass) { $missingClass.Dispose(); throw 'The unique absent ProgID unexpectedly exists' }
+    # The real default-reader case must pass first. Recreate the valid owned
+    # registration that this hosted shell leaves without an effective default.
+    # A nonexistent class alone can silently fall back to txtfile; only the
+    # precise native no-association result below establishes this test state.
+    $existingClass = [Microsoft.Win32.Registry]::ClassesRoot.OpenSubKey($fallbackProgId)
+    if ($null -ne $existingClass) { $existingClass.Dispose(); throw 'The unique fallback fixture ProgID unexpectedly exists' }
+    $registration = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($fallbackClassPath)
+    $fallbackClassCreated = $true
+    try { $registration.SetValue('', 'BrightWheel E2E fallback association', [Microsoft.Win32.RegistryValueKind]::String) }
+    finally { $registration.Dispose() }
+    $shell = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("$fallbackClassPath\shell")
+    try { $shell.SetValue('', 'open', [Microsoft.Win32.RegistryValueKind]::String) }
+    finally { $shell.Dispose() }
+    $command = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("$fallbackClassPath\shell\open\command")
+    try { $command.SetValue('', ('"{0}" "%1"' -f $reader), [Microsoft.Win32.RegistryValueKind]::String) }
+    finally { $command.Dispose() }
     if ($null -eq $extension) { $extension = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($extensionPath) }
     $associationChanged = $true
-    $extension.SetValue('', $missingProgId, [Microsoft.Win32.RegistryValueKind]::String)
+    $extension.SetValue('', $fallbackProgId, [Microsoft.Win32.RegistryValueKind]::String)
     [UpdateLogNative]::SHChangeNotify(0x08000000, 0x1000, [IntPtr]::Zero, [IntPtr]::Zero)
+    Write-Host "Fallback fixture: owned ProgId='$fallbackProgId'; direct registered reader='$([UpdateLogNative]::RegisteredExecutable($fallbackProgId))'; effective ProgId='$([UpdateLogNative]::AssociatedProgId())'"
     # HRESULT_FROM_WIN32(ERROR_NO_ASSOCIATION), not a null executable query:
     # valid packaged/COM associations need not expose ASSOCSTR_EXECUTABLE.
     Wait-For { [UpdateLogNative]::LogAssociationResult() -eq -2147023741 } 'explicit HRESULT 0x80070483 for no .log association'
@@ -453,6 +525,9 @@ try {
             $extension.Dispose()
             if ($removeExtension) { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($extensionPath, $false) }
         }
+    }
+    Invoke-UpdateLogCleanup {
+        if ($fallbackClassCreated) { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($fallbackClassPath, $false) }
     }
     for ($index = $createdCommandKeys.Count - 1; $index -ge 0; $index--) {
         $path = $createdCommandKeys[$index]
