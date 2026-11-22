@@ -121,8 +121,14 @@ jobs:
         shell: pwsh
         run: ./scripts/package-windows.ps1 -Version 999.0.1 -OutputDirectory target/package-e2e
 
+      - name: Verify Inno script and native process controls
+        id: inno_probe
+        if: ${{ !cancelled() && steps.installer_fixture.outcome == 'success' }}
+        shell: pwsh
+        run: ./scripts/e2e/inno-array-probe.ps1 -ReportDirectory "$env:RUNNER_TEMP/winget-upgrade-brightwheel/inno-array-probe"
+
       - name: Verify real WinGet upgrades before publication
-        if: ${{ !cancelled() && steps.installer_fixture.outcome == 'success' && steps.winget_source_tests.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.installer_fixture.outcome == 'success' && steps.winget_source_tests.outcome == 'success' && steps.inno_probe.outcome == 'success' }}
         shell: pwsh
         run: >-
           ./scripts/e2e/winget-upgrade.ps1

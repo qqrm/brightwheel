@@ -199,6 +199,9 @@ checks.
 The candidate source is registered as a trusted test source on that disposable
 VM. It serves the production-generated package metadata and installer hashes;
 the initial portable package still comes from the public `winget` source. The
+harness also hydrates any declared dependencies from official WinGet exports,
+preserving their public installer URLs and metadata, and verifies their exact
+installed product-code/version correlation before the application upgrade. The
 harness temporarily adds its generated test CA to that VM's machine root
 certificate store. It removes that exact certificate, the temporary source,
 and the server when it finishes; private TLS material stays outside uploaded
@@ -214,6 +217,13 @@ for the TLS cases; CI requires those cases to run:
 python -m pip install -r scripts/e2e/winget-test-source-requirements.txt
 python -m unittest discover -s scripts/e2e -p test_winget_test_source.py -v
 ```
+
+Before invoking WinGet, both jobs also compile and run
+`scripts/e2e/inno-array-probe.ps1`. Its required controls check native process
+queries and ownership of a live process handle in a fixed buffer. Dynamic-array
+handoffs are recorded as diagnostic observations, including any mismatches.
+The probe's `result.json` and `setup.log` are preserved with the Windows package
+test artifacts; a required control failure blocks the WinGet scenarios.
 
 ### Packaging and WinGet publication
 
