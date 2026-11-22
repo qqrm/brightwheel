@@ -13,6 +13,7 @@ From the tray icon you can:
 - enable or disable startup with Windows;
 - enable or disable automatic update checks at startup;
 - check for a new release, update in place, and automatically restart;
+- open the update log in the Windows default reader for `.log` files;
 - exit the app.
 
 Scrolling accelerates from precise 2% steps to 10% steps during a continuous
@@ -69,6 +70,16 @@ skips the startup check for that restart to avoid repeated update attempts; the
 next normal launch checks again. Changing the checkbox does not cancel a check
 already in progress. The local update log is at
 `%LOCALAPPDATA%\BrightWheel\updater.log`. No monitor data is uploaded.
+
+Click an **Update failed** notification to open that log, or choose **Open update
+log** from the tray menu at any time. Windows uses your default application for
+`.log` files; if no association exists, BrightWheel falls back to Notepad. A
+missing or unreadable log produces an error with its full path. Opening the
+reader does not block tray controls. Notification clicks refer to the latest
+notification in the running instance; use the menu after restarting BrightWheel
+or when an older entry in Windows notification history is no longer actionable.
+Early helper launch failures and a bounded excerpt of PowerShell errors are
+also recorded, including failures before the helper can initialize its own log.
 
 Runtime lifecycle events and errors are recorded separately in
 `%LOCALAPPDATA%\BrightWheel\runtime.log`: version, launch, relaunch, shell/display
@@ -141,6 +152,18 @@ recovery through actual broadcast delivery, repeats display/resume notifications
 restarts Explorer, and checks normal, unresponsive, and overlapping process
 replacement. These notification tests do not claim a physical suspend/resume
 test; that still needs a Windows machine and its actual display driver.
+
+On the disposable Windows CI runner, `scripts/e2e/update-log.ps1` checks the
+production failure-to-notification path in two phases. A controlled updater child
+verifies bounded stderr capture and replacement of a failure action with an
+informational notification. A fresh production process with the normal Windows
+environment then runs the real PowerShell updater, whose safe basename check
+produces a failure before any network request or executable replacement. Posted
+version-4 callbacks and actual mouse selection of verified tray menu items open
+the exact log path and contents in a real associated reader. The test also checks
+system Notepad when association resolution explicitly reports no handler, and
+restores the original association and settings afterwards. Notification banner
+clicks are represented by native callbacks rather than physical banner input.
 
 ## License
 
