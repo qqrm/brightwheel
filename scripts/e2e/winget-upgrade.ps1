@@ -1160,7 +1160,7 @@ try {
     $initialManifest = Prepare-Manifest $ManifestDirectory $InstallerPath $PackageVersion 'migration'
     $trustedSource = New-TestSourceState ([IO.Path]::GetTempPath()) $Application
     Add-TestSourceVersion $trustedSource $initialManifest $PackageVersion
-    $python = (Get-Command python.exe -CommandType Application -ErrorAction Stop).Source
+    $python = (Get-Command python.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
     Start-TestSource $trustedSource $SourceServerScriptPath $python
 
     $installedByTest = $true
