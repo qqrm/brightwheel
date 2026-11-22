@@ -118,11 +118,15 @@ $notepad = $null
 $config = $null
 $extension = $null
 $extensionExisted = $false
+$openWith = $null
+$openWithExisted = $false
+$openWithValueWritten = $false
 $associationChanged = $false
 # ProgIDs must fit 39 characters; retain the complete random GUID for uniqueness.
 $progId = "BWLog.$unique"
 $progIdPath = "Software\Classes\$progId"
 $extensionPath = 'Software\Classes\.log'
+$openWithPath = "$extensionPath\OpenWithProgids"
 $configPath = 'Software\BrightWheel'
 $savedConfig = @{}
 
@@ -139,6 +143,14 @@ function Wait-For([scriptblock]$condition, [string]$description) {
 function Read-Text([string]$path) {
     if (Test-Path -LiteralPath $path) { return [IO.File]::ReadAllText($path) }
     return ''
+}
+
+function Read-RegistryDefault([Microsoft.Win32.RegistryKey]$root, [string]$path) {
+    $key = $root.OpenSubKey($path)
+    try {
+        if ($null -eq $key) { return '<absent>' }
+        return $key.GetValue('', '<absent>', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    } finally { if ($null -ne $key) { $key.Dispose() } }
 }
 
 function Send-TrayEvent([uint32]$event, [uint32]$iconId = 1) {
@@ -249,9 +261,26 @@ try {
         $registeredCommand = $command.GetValue('')
     }
     finally { $command.Dispose() }
+    # Windows File Types registration requires advertising the owned ProgID in
+    # OpenWithProgids when assigning it as the extension default. Preserve all
+    # other candidates and restore exactly our value/key afterwards.
+    $openWith = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($openWithPath, $true)
+    $openWithExisted = $null -ne $openWith
+    if (-not $openWithExisted) { $openWith = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($openWithPath) }
+    $hadOpenWithValue = $openWith.GetValueNames() -contains $progId
+    if ($hadOpenWithValue) {
+        $oldOpenWithValue = $openWith.GetValue($progId, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $oldOpenWithKind = $openWith.GetValueKind($progId)
+    }
+    $openWithValueWritten = $true
+    $openWith.SetValue($progId, [byte[]]@(), [Microsoft.Win32.RegistryValueKind]::None)
     $associationChanged = $true
     $extension.SetValue('', $progId, [Microsoft.Win32.RegistryValueKind]::String)
     Write-Host "Fixture registration: ProgId='$progId'; HKCU extension='$($extension.GetValue(''))'; command='$registeredCommand'; direct ProgId reader='$([UpdateLogNative]::RegisteredExecutable($progId))'"
+    $mergedExtension = Read-RegistryDefault ([Microsoft.Win32.Registry]::ClassesRoot) '.log'
+    $mergedClass = Read-RegistryDefault ([Microsoft.Win32.Registry]::ClassesRoot) $progId
+    $mergedCommand = Read-RegistryDefault ([Microsoft.Win32.Registry]::ClassesRoot) "$progId\shell\open\command"
+    Write-Host "Fixture merged HKCR: .log default='$mergedExtension'; class default='$mergedClass'; open command='$mergedCommand'; owned OpenWith value=$($openWith.GetValueNames() -contains $progId)"
     # SHCNF_IDLIST | SHCNF_FLUSH waits for change delivery; do not race shell
     # cache invalidation immediately after registering the disposable reader.
     [UpdateLogNative]::SHChangeNotify(0x08000000, 0x1000, [IntPtr]::Zero, [IntPtr]::Zero)
@@ -397,6 +426,19 @@ try {
             $removeConfig = -not $configExisted -and $config.ValueCount -eq 0 -and $config.SubKeyCount -eq 0
             $config.Dispose()
             if ($removeConfig) { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($configPath, $false) }
+        }
+    }
+    Invoke-UpdateLogCleanup {
+        if ($openWithValueWritten) {
+            if ($hadOpenWithValue) { $openWith.SetValue($progId, $oldOpenWithValue, $oldOpenWithKind) }
+            else { $openWith.DeleteValue($progId, $false) }
+        }
+    }
+    Invoke-UpdateLogCleanup {
+        if ($null -ne $openWith) {
+            $removeOpenWith = -not $openWithExisted -and $openWith.ValueCount -eq 0 -and $openWith.SubKeyCount -eq 0
+            $openWith.Dispose()
+            if ($removeOpenWith) { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($openWithPath, $false) }
         }
     }
     Invoke-UpdateLogCleanup {
