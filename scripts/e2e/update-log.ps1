@@ -13,8 +13,6 @@ if (Get-Process -Name brightwheel -ErrorAction SilentlyContinue) {
     throw 'Update-log E2E requires no existing BrightWheel process.'
 }
 
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -AssemblyName UIAutomationTypes
 Add-Type -TypeDefinition @'
 using System;
 using System.Text;
@@ -22,6 +20,14 @@ using System.Runtime.InteropServices;
 public static class UpdateLogNative {
     [StructLayout(LayoutKind.Sequential)]
     public struct Rect { public int Left, Top, Right, Bottom; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Point { public int X, Y; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MouseInput { public int X, Y; public uint Data, Flags, Time; public UIntPtr ExtraInfo; }
+    [StructLayout(LayoutKind.Explicit)]
+    private struct InputUnion { [FieldOffset(0)] public MouseInput Mouse; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Input { public uint Type; public InputUnion Value; }
     [StructLayout(LayoutKind.Sequential)]
     public struct Identifier { public uint Size; public IntPtr Window; public uint Id; public Guid Guid; }
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -43,6 +49,16 @@ public static class UpdateLogNative {
     public static extern uint GetMenuState(IntPtr menu, uint item, uint flags);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern int GetMenuString(IntPtr menu, uint item, StringBuilder text, int capacity, uint flags);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool GetMenuItemRect(IntPtr window, IntPtr menu, uint item, out Rect rect);
+    [DllImport("user32.dll")]
+    private static extern IntPtr WindowFromPoint(Point point);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool GetCursorPos(out Point point);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint SendInput(uint count, Input[] inputs, int size);
     [DllImport("user32.dll")]
     public static extern IntPtr GetWindow(IntPtr window, uint command);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -117,6 +133,38 @@ public static class UpdateLogNative {
             return output.Count < 8;
         }, IntPtr.Zero);
         return output.ToArray();
+    }
+    public static string ClickMenuItem(IntPtr popup, IntPtr menu, uint index, uint processId) {
+        uint owner;
+        GetWindowThreadProcessId(popup, out owner);
+        if (owner != processId || !IsWindowVisible(popup))
+            throw new InvalidOperationException("The owned menu popup is no longer visible");
+        Rect rect;
+        // NULL lets Windows locate the window for this displayed popup menu.
+        if (!GetMenuItemRect(IntPtr.Zero, menu, index, out rect))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "GetMenuItemRect failed for menu index " + index);
+        if (rect.Right <= rect.Left || rect.Bottom <= rect.Top)
+            throw new InvalidOperationException("GetMenuItemRect returned an empty item rectangle");
+        var center = new Point { X = rect.Left + (rect.Right - rect.Left) / 2, Y = rect.Top + (rect.Bottom - rect.Top) / 2 };
+        if (!SetCursorPos(center.X, center.Y))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "SetCursorPos failed for the owned menu item");
+        Point cursor;
+        if (!GetCursorPos(out cursor))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "GetCursorPos failed before menu input");
+        IntPtr hit = WindowFromPoint(center);
+        GetWindowThreadProcessId(popup, out owner);
+        if (hit != popup || owner != processId || !IsWindowVisible(popup) || cursor.X != center.X || cursor.Y != center.Y)
+            throw new InvalidOperationException("Menu click target changed: expected HWND 0x" + popup.ToString("X") +
+                "; hit HWND 0x" + hit.ToString("X") + "; expected PID=" + processId + "; actual PID=" + owner);
+        var inputs = new Input[2];
+        inputs[0].Value.Mouse.Flags = 0x0002; // MOUSEEVENTF_LEFTDOWN
+        inputs[1].Value.Mouse.Flags = 0x0004; // MOUSEEVENTF_LEFTUP
+        uint sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Input)));
+        if (sent != inputs.Length)
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "SendInput inserted " + sent + " of 2 menu mouse events");
+        return "Clicked owned menu index=" + index + "; HWND=0x" + popup.ToString("X") +
+            "; rectangle=" + rect.Left + "," + rect.Top + "," + rect.Right + "," + rect.Bottom +
+            "; center=" + center.X + "," + center.Y;
     }
 }
 '@
@@ -216,8 +264,8 @@ function Invoke-TrayMenu([uint32]$commandId, [string]$label) {
         $null = [UpdateLogNative]::GetWindowThreadProcessId($script:popup, [ref]$ownerPid)
         $script:popup -ne [IntPtr]::Zero -and $ownerPid -eq $process.Id
     } 'the production tray popup menu'
-    # MN_GETHMENU reads the real TrackPopupMenu menu. Invoke its actual UI
-    # Automation item only after checking the command ID and enabled label.
+    # MN_GETHMENU reads the real TrackPopupMenu menu. Click its displayed item
+    # only after checking the command ID, exact enabled label, and popup owner.
     $menu = [UpdateLogNative]::SendMessage($script:popup, 0x01e1, [UIntPtr]::Zero, [IntPtr]::Zero)
     $found = $false
     for ($index = 0; $index -lt [UpdateLogNative]::GetMenuItemCount($menu); $index++) {
@@ -232,18 +280,9 @@ function Invoke-TrayMenu([uint32]$commandId, [string]$label) {
         }
     }
     if (-not $found) { throw "Tray menu did not expose enabled '$label'" }
-    $popupElement = [System.Windows.Automation.AutomationElement]::FromHandle($script:popup)
-    $nameCondition = [System.Windows.Automation.PropertyCondition]::new(
-        [System.Windows.Automation.AutomationElement]::NameProperty, $label)
-    Wait-For {
-        $script:menuItem = $popupElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $nameCondition)
-        $null -ne $script:menuItem -and $script:menuItem.Current.ProcessId -eq $process.Id -and
-            $script:menuItem.Current.IsEnabled -and
-            $script:menuItem.Current.ControlType -eq [System.Windows.Automation.ControlType]::MenuItem
-    } "the owned UI Automation menu item '$label'"
-    $invoke = [System.Windows.Automation.InvokePattern]$script:menuItem.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
-    Write-Host "Invoking owned tray menu: pid=$($process.Id); command=$commandId; label='$label'"
-    $invoke.Invoke()
+    Write-Host "Selecting owned tray menu: pid=$($process.Id); command=$commandId; label='$label'"
+    try { Write-Host ([UpdateLogNative]::ClickMenuItem($script:popup, $menu, [uint32]$index, [uint32]$process.Id)) }
+    catch { Write-TimeoutDiagnostics "native click on '$label'"; throw }
     Wait-For { [UpdateLogNative]::FindWindow('#32768', $null) -eq [IntPtr]::Zero } 'menu selection'
 }
 
